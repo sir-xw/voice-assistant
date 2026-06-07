@@ -73,7 +73,7 @@ class VoiceFrontendConfig:
     on_final: Callable[[str], None] | None = None
     on_error: Callable[[str], None] | None = None
     on_state_change: Callable[[VoiceState], None] | None = None
-    on_wake_word: Callable[[], None] | None = None
+    on_wake_word: Callable[[str], None] | None = None  # 参数: 唤醒词原文
     on_interrupt_request: Callable[[], None] | None = None
 
     on_play_prompt: Callable[[], None] | None = None
@@ -175,6 +175,9 @@ class VoiceFrontend:
 
         # 音频流
         self._audio_stream = None
+        # 音频处理队列（回调 → 工作线程，避免阻塞音频回调导致 overflow）
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=64)
+        self._audio_consumer: threading.Thread | None = None
 
         # sherpa-onnx 唤醒词
         self._spotter = None
@@ -290,10 +293,13 @@ class VoiceFrontend:
         model_dir = project_root / self.config.kws_model_dir
         model_path = model_dir / self.config.kws_model_name
 
-        # 生成 keywords.txt
-        final_kw = _auto_format_keyword(keyword)
+        # keywords.txt 由 tools/gen_keywords.py 从 raw_keywords.txt 生成
+        # 如果不存在则从第一个 agent 的 name 回退生成一个
         kw_file = model_path / "keywords.txt"
-        kw_file.write_text(final_kw, encoding="utf-8")
+        if not kw_file.exists():
+            final_kw = _auto_format_keyword(keyword)
+            kw_file.write_text(f"{final_kw} @{keyword}\n", encoding="utf-8")
+            logger.info("keywords.txt 不存在，从 config 自动生成: %s → %s", keyword, final_kw)
 
         if not model_path.exists():
             logger.error(f"sherpa-onnx model not found at {model_path}")
@@ -315,17 +321,21 @@ class VoiceFrontend:
                 num_trailing_blanks=1, provider="cpu",
             )
             self._kw_stream = self._spotter.create_stream()
-            logger.info(f"sherpa-onnx KWS initialized (keyword={keyword}, pinyin={final_kw})")
+            logger.info(f"sherpa-onnx KWS initialized")
         except Exception as e:
             logger.error(f"sherpa-onnx KWS init failed: {e}")
             self._spotter = None
             self._kw_stream = None
 
-    def _check_wake_word(self, audio_samples: np.ndarray) -> bool:
+    def _check_wake_word(self, audio_samples: np.ndarray) -> str | None:
+        """
+        检测唤醒词。
+        返回 keywords.txt 中 @ 后面的原始文本（如 "赫尔墨斯"），
+        未命中则返回 None。
+        """
         if self._spotter is None or self._kw_stream is None:
-            return False
+            return None
         try:
-            # sherpa-onnx 需要 float32 音频（范围 -1.0 ~ 1.0）
             audio_float = audio_samples.astype(np.float32) / 32768.0
             self._kw_stream.accept_waveform(SAMPLE_RATE, audio_float)
             while self._spotter.is_ready(self._kw_stream):
@@ -333,10 +343,12 @@ class VoiceFrontend:
                 result = self._spotter.get_result(self._kw_stream)
                 if result:
                     self._spotter.reset_stream(self._kw_stream)
-                    return True
+                    # result 是 str，如 "赫尔墨斯"
+                    keyword = result.strip()
+                    return keyword
         except Exception:
             pass
-        return False
+        return None
 
     # 麦克风
     def _start_mic(self):
@@ -348,7 +360,16 @@ class VoiceFrontend:
             if status:
                 logger.debug(f"Audio status: {status}")
             pcm_data = indata.tobytes()
-            self._process_audio_frame(pcm_data, indata)
+            try:
+                self._audio_queue.put_nowait((pcm_data, indata))
+            except queue.Full:
+                pass  # 丢弃最旧帧，防止阻塞回调
+
+        # 启动消费者线程（处理 VAD、唤醒词等耗时操作）
+        self._audio_consumer = threading.Thread(
+            target=self._audio_consumer_loop, daemon=True, name="audio-proc"
+        )
+        self._audio_consumer.start()
 
         try:
             self._audio_stream = sd.InputStream(
@@ -356,7 +377,7 @@ class VoiceFrontend:
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=FRAME_SIZE,
-                latency="low",
+                latency="high",
                 callback=audio_callback,
             )
             self._audio_stream.start()
@@ -366,6 +387,19 @@ class VoiceFrontend:
             self._set_state(VoiceState.ERROR)
             if self.config.on_error:
                 self.config.on_error(f"麦克风启动失败: {e}")
+
+    def _audio_consumer_loop(self):
+        """音频队列消费者：在独立线程中处理 VAD、唤醒词等耗时操作。"""
+        logger.debug("Audio consumer started")
+        while self._running:
+            try:
+                pcm_bytes, audio_array = self._audio_queue.get(timeout=1.0)
+                self._process_audio_frame(pcm_bytes, audio_array)
+            except queue.Empty:
+                continue
+            except Exception:
+                logger.exception("Audio consumer error")
+        logger.debug("Audio consumer stopped")
 
     # 核心状态机
     def _process_audio_frame(self, pcm_bytes: bytes, audio_array: np.ndarray):
@@ -377,9 +411,10 @@ class VoiceFrontend:
 
         if state == VoiceState.IDLE:
             if self.config.wake_word_enabled:
-                if self._check_wake_word(samples):
-                    logger.info("Wake word detected!")
-                    self._on_wake_word_detected()
+                kw = self._check_wake_word(samples)
+                if kw:
+                    logger.info("Wake word detected: %s", kw)
+                    self._on_wake_word_detected(kw)
 
         elif state == VoiceState.CONVERSATION:
             # TTS 播放期间不送 ASR
@@ -452,7 +487,7 @@ class VoiceFrontend:
             buf_bytes = np.array(buf_samples, dtype=np.int16).tobytes()
             self.asr_engine.feed_audio(buf_bytes)
 
-    def _on_wake_word_detected(self):
+    def _on_wake_word_detected(self, keyword: str):
         """唤醒词命中：打断 + 播提示音 + 立即 ASR。"""
         self._cancel_conversation_timer()
         self._speech_start_time = None
@@ -462,6 +497,10 @@ class VoiceFrontend:
         self._speech_confirm_counter = 0
 
         self.interrupt()
+
+        # 通知上层哪个唤醒词触发了
+        if self.config.on_wake_word:
+            self.config.on_wake_word(keyword)
 
         # TTS 播放期间的打断不播提示音，避免回声再次触发
         if not self._tts_playing:
@@ -478,9 +517,6 @@ class VoiceFrontend:
             self._recording_start_time = time.time()
             self._prompt_end_time = time.time() + self.config.prompt_duration_sec
             self.asr_engine.start_recognition()
-
-        if self.config.on_wake_word:
-            self.config.on_wake_word()
 
     def _start_recording(self):
         """启动 ASR 识别。"""

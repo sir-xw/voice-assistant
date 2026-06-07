@@ -16,7 +16,6 @@ Hermes Agent 语音输入前端 — 入口点。
 import asyncio
 import logging
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -52,17 +51,17 @@ class VoiceApp:
         self.tts_engine: TencentCloudTTSEngine | None = None
         self.audio_player: AudioPlayer | None = None
         self.frontend: VoiceFrontend | None = None
-        self.hermes_agent: AIAgent | None = None
 
-        # 线程池（agent.chat 是同步阻塞的）
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes")
+        # 多 AI Agent 实例：{name: (agent, executor, history, generation)}
+        # 每个 agent 有独享的 ThreadPoolExecutor、会话历史和代际计数器
+        self._agents: dict[str, tuple] = {}
+        self._active_name: str | None = None  # 当前由哪个唤醒词触发
         self._loop: asyncio.AbstractEventLoop | None = None
 
-        # 代际计数器：每次唤醒词递增，旧结果的 speak 自动丢弃
-        self._generation = 0
-        self._gen_lock = threading.Lock()
-        # 会话历史
-        self.history = None
+        # 待汇报队列：agent 完成但当前有其他 agent 活跃时排队
+        # 元素: (keyword, response_text, gen)
+        self._pending: list[tuple[str, str, int]] = []
+        self._user_title = self.config.get("user_title", "主人")
 
     # ─── 生命周期 ────────────────────────────────────────
 
@@ -74,7 +73,6 @@ class VoiceApp:
         logger.info("=" * 50)
 
         tencent_cfg = self._full_cfg.get("tencent", {})
-        hermes_cfg = self.config.get("hermes_agent", {})
 
         # 1. ASR 引擎
         asr_config = TencentASRConfig(
@@ -88,7 +86,9 @@ class VoiceApp:
         self.asr_engine = TencentCloudASREngine(asr_config)
         self.asr_engine.on_start = self._on_asr_start
         self.asr_engine.on_interim = self._on_asr_interim
-        self.asr_engine.on_final = self._on_asr_final
+        # 不绑定 on_final：服务端 VAD 可能在用户句间停顿时就触发 on_sentence_end，
+        # 导致 agent 在用户未说完时就开始回答。仅在 on_complete 后由本地 VAD 控制时机。
+        self.asr_engine.on_final = None
         self.asr_engine.on_complete = self._on_asr_complete
         self.asr_engine.on_error = self._on_asr_error
 
@@ -114,35 +114,33 @@ class VoiceApp:
             # TTS 音频 → 播放器
             self.tts_engine.on_audio_chunk = self.audio_player.feed
 
-        # 4. Hermes Agent（单实例，保持 session + 记忆）
-        model = hermes_cfg.get("model", "openai/gpt-4o-mini")
-        self._agent_session_id = hermes_cfg.get("session_id", "hermes-voice-session")
-        self._agent_system_prompt = hermes_cfg.get(
-            "system_prompt",
-            "你是一个语音助手。\n\n"
-            "重要规则：\n"
-            "1. 用户的输入来自语音识别（ASR），可能存在同音字、漏字、多字等错误。\n"
-            "   如果问题听起来不合逻辑，结合上下文做合理推断。\n"
-            "2. 回答要简洁，控制在 3 句话以内。\n"
-            "3. 回答中自然融入确认，不需要生硬复述。\n"
-            "4. 如果实在听不懂，直接说「不好意思没听清，能再说一遍吗？」"
-        )
-        self.hermes_agent = AIAgent(
-            model=model,
-            quiet_mode=True,
-            skip_context_files=True,   # 启用 AGENTS.md
-            skip_memory=True,           # 启用长期记忆
-            max_iterations=hermes_cfg.get("max_iterations", 10),
-            session_id=self._agent_session_id,  # 固定会话
-            ephemeral_system_prompt=self._agent_system_prompt,
-            reasoning_config={'enabled': False},
-        )
-        logger.info(f"Hermes Agent initialized: model={model}, session={self._agent_session_id}")
+        # 4. 初始化 AI Agent 实例（每个唤醒词一个，每个有独享线程池）
+        agents_config = self.config.get("agents", [])
+
+        for ac in agents_config:
+            name = ac["name"]
+            agent = AIAgent(
+                model=ac.get("model", "openai/gpt-4o-mini"),
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                max_iterations=ac.get("max_iterations", 10),
+                session_id=ac.get("session_id", f"hermes-{name}"),
+                ephemeral_system_prompt=ac.get("system_prompt", ""),
+                reasoning_config={'enabled': False},
+            )
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
+            self._agents[name] = (agent, executor, None, 0)  # (agent, executor, history, generation)
+            logger.info("Agent [%s]: model=%s, session=%s",
+                        name, ac.get("model"), ac.get("session_id"))
+
+        logger.info("Total agents: %d", len(self._agents))
 
         # 5. 语音前端
+        first_agent_name = agents_config[0]["name"] if agents_config else "赫尔墨斯"
         frontend_config = VoiceFrontendConfig(
             wake_word_enabled=self.config["wake_word"]["enabled"],
-            wake_word_keyword=self.config["wake_word"]["keyword"],
+            wake_word_keyword=first_agent_name,
             wake_word_threshold=self.config["wake_word"].get("threshold", 0.25),
             wake_word_score=self.config["wake_word"].get("score", 1.0),
             # KWS 模型路径和文件名（从 config.yaml 读取）
@@ -172,9 +170,9 @@ class VoiceApp:
         self._running = True
         logger.info("=" * 50)
         logger.info("Ready — say the wake word to start")
-        logger.info(f"  Wake word : '{self.config['wake_word']['keyword']}'")
+        logger.info(f"  Wake words: {list(self._agents.keys())}")
         logger.info(f"  ASR model : {asr_config.engine_model}")
-        logger.info(f"  Agent model: {model}")
+        logger.info(f"  Agents    : {len(self._agents)} ({', '.join(self._agents.keys())})")
         logger.info(f"  TTS voice : {tts_config.voice_type}")
         logger.info("=" * 50)
 
@@ -184,75 +182,77 @@ class VoiceApp:
             self.frontend.stop()
         if self.audio_player:
             self.audio_player.stop()
-        self._executor.shutdown(wait=False)
+        for name, (agent, executor, history, gen) in self._agents.items():
+            executor.shutdown(wait=False)
         logger.info("Voice frontend stopped")
 
     # ─── 核心流程 ────────────────────────────────────────
 
-    def _ask_hermes(self, text: str):
+    def _ask_agent(self, text: str, name: str):
         """
-        在后台线程中用 Hermes Agent 问答（单实例，保持 session + 记忆）。
+        在后台线程中用对应唤醒词的 Hermes Agent 问答。
 
-        使用固定 session_id 保持对话连续性。
-        系统提示词说明输入来自语音识别，要求复述确认 + 简洁回答。
-        代际计数器防止旧结果在打断后播报。
+        如果 agent 仍是当前活跃的，完成时立即 TTS；
+        如果已被其他唤醒词取代，结果进入待汇报队列排队，
+        等待当前连续对话窗口过期后递送。
         """
-        with self._gen_lock:
-            gen = self._generation
-
-        if self.hermes_agent is None:
-            logger.error("Hermes Agent not initialized")
+        entry = self._agents.get(name)
+        if entry is None:
+            logger.error("No agent for name: %s", name)
             return
 
+        agent, executor, history, gen = entry
+
         def _chat():
+            nonlocal history
             try:
-                # 清除上一轮 interrupt 残留
-                self.hermes_agent._interrupt_requested = False
+                agent._interrupt_requested = False
 
-                logger.info(f"🤔 (gen={gen}) Asking Hermes: {text[:60]}...")
-                result = self.hermes_agent.run_conversation(
+                logger.info(f"(gen={gen}) [{name}] Asking: {text[:60]}...")
+                result = agent.run_conversation(
                     user_message=text,
-                    conversation_history=self.history,
+                    conversation_history=history,
                 )
-                self.history = result["messages"]
+                history = result["messages"]
+                self._agents[name] = (agent, executor, history, gen)
                 response = result.get("final_response", "")
-                logger.info(f"🤖 (gen={gen}) Hermes: {response[:80]}...")
-                asyncio.run_coroutine_threadsafe(
-                    self._speak(response, gen), self._loop
-                )
+                logger.info(f"(gen={gen}) [{name}] Response: {response[:80]}...")
+
+                # 取当前代际，判断结果是否仍有效
+                _, _, _, current_gen = self._agents.get(name, (None, None, None, -1))
+                if gen != current_gen:
+                    logger.info(f"🚫 [{name}] gen {gen} != current {current_gen}, stale")
+                    return
+
+                if name == self._active_name:
+                    asyncio.run_coroutine_threadsafe(
+                        self._speak(response), self._loop
+                    )
+                else:
+                    self._pending.append((name, response, gen))
+                    logger.info(f"📥 [{name}] queued (pending={len(self._pending)})")
             except Exception as e:
-                logger.error(f"Hermes chat error: {e}")
+                logger.error(f"Agent [{name}] chat error: {e}")
 
-        self._executor.submit(_chat)
+        executor.submit(_chat)
 
-    async def _speak(self, text: str, gen: int):
-        """TTS 合成并播放。若代际已过时则静默丢弃。"""
+    async def _speak(self, text: str):
+        """TTS 合成并播放。代际检查由调用方负责。"""
         if not text.strip() or not self.tts_engine:
             return
 
-        # 检查代际是否仍有效
-        with self._gen_lock:
-            if gen != self._generation:
-                logger.info(f"🚫 (gen={gen}) discarding stale TTS (current={self._generation})")
-                return
-
-        logger.info(f"🔊 (gen={gen}) TTS: {text[:60]}...")
+        logger.info(f"🔊 TTS: {text[:60]}...")
         try:
-            # 标记 TTS 播放中 → 前段不送 ASR
             if self.frontend:
                 self.frontend.set_tts_playing(True)
             self.tts_engine.start()
             self.tts_engine.synthesize(text)
             self.tts_engine.complete()
             self.tts_engine.wait(timeout=15)
-            # 等 AudioPlayer 真正播完
             if self.audio_player:
                 self.audio_player.wait_for_drain(timeout=15.0)
-                # sounddevice 硬件缓冲还有 ~blocksize 的延迟
                 import time as _t
                 _t.sleep(0.15)
-            # 提示音（非人声），表示可以继续说话
-            # 等提示音播完再开对话窗口，防止麦克风采集到提示音触发 VAD
             self._play_asset("notification")
             if self.audio_player:
                 self.audio_player.wait_for_drain(timeout=5.0)
@@ -262,25 +262,52 @@ class VoiceApp:
         except Exception as e:
             logger.warning(f"TTS error: {e}")
         finally:
-            # 无论 TTS 完成还是被打断，都恢复门控
             if self.frontend:
                 self.frontend.set_tts_playing(False)
+        # TTS 播放完毕后尝试递送队列中的待汇报结果
+        self._deliver_pending()
+
+    def _deliver_pending(self):
+        """
+        递送队列中的待汇报结果。
+
+        条件：frontend 处于 IDLE 状态（无 ASR、TTS、连续对话），
+        且队列非空。
+        格式："{user_title}，我是{keyword}，{text}"
+        """
+        if not self._pending:
+            return
+        if self.frontend and self.frontend.state.value != "idle":
+            return
+
+        kw, text, gen = self._pending.pop(0)
+        # 检查该 agent 的代际是否仍匹配
+        _, _, _, current_gen = self._agents.get(kw, (None, None, None, -1))
+        if gen != current_gen:
+            logger.info(f"🚫 Pending [{kw}] gen {gen} != current {current_gen}, discard")
+            self._deliver_pending()  # 尝试下一个
+            return
+
+        greeting = f"{self._user_title}，我是{kw}，{text}"
+        logger.info("📤 Delivering pending result from [%s]: %s...", kw, text[:60])
+        asyncio.run_coroutine_threadsafe(
+            self._speak(greeting), self._loop
+        )
 
     def _cancel_current_output(self):
-        """
-        打断当前输出（仅停 TTS + 停工具，不丢弃 agent 结果）。
-        唤醒词命中时调用。
-        """
-        logger.info(f"⏹ Interrupting current output")
+        """打断当前输出（TTS + 当前活跃 agent 的工具调用）。"""
+        logger.info("⏹ Interrupting current output")
 
-        # 打断正在进行的 agent 工具调用
-        if self.hermes_agent:
-            try:
-                self.hermes_agent.interrupt()
-            except Exception as e:
-                logger.debug(f"Agent interrupt: {e}")
+        # 打断当前活跃 agent
+        if self._active_name:
+            entry = self._agents.get(self._active_name)
+            if entry:
+                agent, _, _, _ = entry
+                try:
+                    agent.interrupt()
+                except Exception as e:
+                    logger.debug(f"Agent interrupt: {e}")
 
-        # 打断 TTS
         if self.tts_engine:
             self.tts_engine.interrupt()
         if self.audio_player:
@@ -323,8 +350,17 @@ class VoiceApp:
         """播唤醒提示音。"""
         self._play_asset("prompt")
 
-    def _on_wake_word(self):
-        logger.info("🔊 Wake word! (interrupt handled by on_interrupt_request)")
+    def _on_wake_word(self, name: str):
+        """唤醒词命中：记录活跃 name，递增该 agent 代际。"""
+        self._active_name = name
+        # 递增该 agent 的代际（旧结果自动失效）
+        entry = self._agents.get(name)
+        if entry:
+            agent, executor, history, gen = entry
+            self._agents[name] = (agent, executor, history, gen + 1)
+            logger.info("🔊 Wake word: '%s' (gen=%d)", name, gen + 1)
+        else:
+            logger.info("🔊 Wake word: '%s' (no agent)", name)
 
     def _on_interrupt_request(self):
         """VoiceFrontend 在唤醒词命中时首先调用此回调。"""
@@ -332,6 +368,9 @@ class VoiceApp:
 
     def _on_frontend_state_change(self, state):
         logger.debug(f"Frontend: {state.value}")
+        # 连续对话窗口过期 → IDLE → 递送待汇报结果
+        if state.value == "idle":
+            self._deliver_pending()
 
     def _on_frontend_interim(self, text: str):
         pass
@@ -339,9 +378,12 @@ class VoiceApp:
     def _on_frontend_final(self, text: str):
         if not text.strip():
             return
-        logger.info(f"📝 User said: {text}")
-        # 直接调用嵌入的 Hermes Agent
-        self._ask_hermes(text)
+        name = self._active_name
+        if name is None:
+            logger.warning("No active agent for ASR result")
+            return
+        logger.info(f"📝 [{name}] User said: {text}")
+        self._ask_agent(text, name)
 
     def _on_frontend_error(self, msg: str):
         logger.error(f"❌ Frontend: {msg}")
@@ -353,8 +395,12 @@ class VoiceApp:
 
     def _on_asr_complete(self):
         logger.debug("ASR complete")
-        # ASR 返回空文本 → 播放告别语
-        if self.asr_engine and not self.asr_engine.last_text.strip():
+        # 兜底：如果 on_final 未被 SDK 回调，从 last_text 补发
+        if self.asr_engine and self.asr_engine.last_text.strip():
+            if self.frontend and self.frontend.config.on_final:
+                self.frontend.config.on_final(self.asr_engine.last_text)
+        else:
+            # ASR 返回空文本 → 播放告别语
             self._play_asset("farewell")
 
     def _on_asr_interim(self, text: str):

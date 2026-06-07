@@ -17,6 +17,66 @@
 - **语音合成**：腾讯云 TTS
 - **回声消除**：系统级 PipeWire（非软件 AEC）
 
+## 多 Agent 机制
+
+系统支持多个 AI Agent 实例，每个由不同的唤醒词触发，拥有独立会话历史和线程池。
+
+### 工作方式
+
+```
+唤醒词 "赫尔墨斯"  ──→  Agent A（通用助手）
+唤醒词 "翻译助手"  ──→  Agent B（翻译助手）
+唤醒词 "code"      ──→  Agent C（编程助手）
+```
+
+每个 Agent 在 `config.yaml` 的 `agents` 列表中配置：
+
+```yaml
+agents:
+  - name: "赫尔墨斯"
+    model: "deepseek-v4-flash"
+    session_id: "hermes-voice-session"
+    system_prompt: |
+      你是一个语音助手。
+      ...
+
+  - name: "翻译助手"
+    model: "openai/gpt-4o-mini"
+    session_id: "translator-session"
+    system_prompt: |
+      你是一个翻译助手。将用户的输入翻译成英文。
+```
+
+### 唤醒词绑定
+
+唤醒词通过 `keywords.txt` 中的 `@original` 部分匹配：
+
+```
+# raw_keywords.txt
+n ǐ h ǎo @你好小娜          → 匹配 agents[].name: "你好小娜"
+f ān y ì @翻译助手           → 匹配 agents[].name: "翻译助手"
+```
+
+使用 `tools/gen_keywords.py` 管理唤醒词列表。
+
+### 待汇报队列
+
+当一个 Agent 正在处理时，用户说出另一唤醒词切换 Agent：
+
+```
+① 用户说 "赫尔墨斯"                           → Agent A 开始处理
+② 用户说 "翻译助手"（Agent A 未完成）         → 活跃 name 切换为 "翻译助手"
+③ Agent A 完成 → 不是当前活跃 → 进入待汇报队列
+④ Agent B 完成 → 仍是当前活跃 → 立即 TTS 播报
+⑤ Agent B 连续对话窗口过期（8s 无说话）       → 递送队列中 Agent A 的结果
+⑥ "主人，我是赫尔墨斯，{回答}"
+```
+
+- 每个 Agent 有**独享的 ThreadPoolExecutor**，后台处理互不阻塞
+- Agent 完成时若仍是当前活跃的，立即播报；否则进入**待汇报队列**
+- 队列在**连续对话窗口过期**（frontend 回到 IDLE）时自动递送
+- 递送格式：`"{user_title}，我是{keyword}，{回答文本}"`
+
 ## 快速开始
 
 ### 1. 安装 Hermes Agent
@@ -186,17 +246,21 @@ sudo journalctl -u hermes-voice -f  # 查看日志
 
 | 配置路径 | 默认值 | 说明 |
 |----------|--------|------|
-| `wake_word.keyword` | `赫尔墨斯` | 唤醒词文本 |
+| `user_title` | `主人` | 语音助手对用户的称呼 |
 | `wake_word.threshold` | `0.5` | KWS 检测阈值（越高越严格） |
 | `wake_word.score` | `1.0` | KWS 关键词加分 |
 | `wake_word.model.dir` | `models/sherpa-kws` | KWS 模型目录（相对项目根） |
 | `wake_word.model.name` | `sherpa-onnx-kws-...` | KWS 模型子目录名 |
+| `agents[].name` | `赫尔墨斯` | 触发该 Agent 的唤醒词（匹配 keywords.txt 中 @ 后的原文） |
+| `agents[].model` | `deepseek-v4-flash` | Agent 使用的 LLM 模型 |
+| `agents[].max_iterations` | `10` | Agent 最大推理迭代次数 |
+| `agents[].session_id` | `hermes-{keyword}` | 会话 ID（保持对话连续性） |
+| `agents[].system_prompt` | (内置) | Agent 系统提示词 |
 | `vad.mode` | `3` | VAD 灵敏度（0-3，3 最敏感） |
 | `vad.silence_threshold_ms` | `1000` | 静音超时（ms） |
 | `vad.speech_confirm_frames` | `3` | 语音确认所需连续帧数 |
 | `asr.engine_model` | `16k_zh` | 腾讯云 ASR 引擎模型 |
 | `tts.voice_type` | `101001` | TTS 音色 ID |
-| `hermes_agent.model` | `deepseek-v4-flash` | 对话模型 |
 | `conversation_window.timeout_sec` | `8.0` | 连续对话窗口（秒） |
 
 ## 测试脚本
@@ -212,6 +276,7 @@ sudo journalctl -u hermes-voice -f  # 查看日志
 
 | 脚本 | 用途 |
 |------|------|
+| `tools/gen_keywords.py` | 从 raw_keywords.txt 生成 keywords.txt（中文自动转拼音） |
 | `tools/tts_gen.py` | 文本→语音（生成 assets 提示音 WAV） |
 | `tools/measure_delay.py` | 扬声器→麦克风延迟探测（PipeWire 延迟调优） |
 

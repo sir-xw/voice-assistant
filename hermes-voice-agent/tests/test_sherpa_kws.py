@@ -103,9 +103,9 @@ def auto_format(text: str) -> str:
         for syl in syllables:
             for syl1 in syl:
                 parts.append(_split_pinyin_syllable(syl1))
-        return "  ".join(parts)
+        return "  ".join(parts) + ' @' + text.strip()
     # 英文直接保留
-    return text.strip().lower()
+    return text.strip().lower() + ' @' + text.strip()
 
 
 def test_keyword(keyword: str = None, pinyin_text: str = None,
@@ -131,7 +131,7 @@ def test_keyword(keyword: str = None, pinyin_text: str = None,
     print(f"   阈值:    {threshold}")
     print(f"   chunk:   {chunk}")
 
-    kw_file = MODEL_DIR / "keywords.txt"
+    kw_file = Path('tests') / "keywords.txt"
     kw_file.write_text(final_kw, encoding="utf-8")
 
     sfx = f"chunk-{chunk}-left-64"
@@ -185,11 +185,7 @@ def test_keyword(keyword: str = None, pinyin_text: str = None,
                     if result:
                         idx += 1
                         print(f"\n🔊 检测到! (第{idx}次)")
-                        try:
-                            d = json.loads(result)
-                            print(f"   关键词: {d.get('keyword','?')}")
-                        except json.JSONDecodeError:
-                            print(f"   {result}")
+                        print(f"   {result}")
                         spotter.reset_stream(stream)
     except KeyboardInterrupt:
         print(f"\n\n📊 检测 {idx} 次")

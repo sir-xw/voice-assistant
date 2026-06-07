@@ -287,7 +287,7 @@ class SpeechRecognizer:
                          (format(error), self.voice_id))
             self.status = ERROR
 
-        def on_close(ws):
+        def on_close(ws, *args):
             self.status = CLOSED
             logger.info("websocket closed  voice id %s" %
                           self.voice_id)
