@@ -1,0 +1,31 @@
+1.使用官方推荐快捷方式安装hermes-agent
+
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+
+2.后续的python依赖模块都安装在hermes的uv环境里
+source /usr/local/lib/hermes-agent/venv/bin/activate
+# 编译pyaudio需要
+sudo apt-get install libportaudio-ocaml-dev
+pip install -r requirements.txt
+
+3.部署语音助手代码
+git clone xxx/hermes-voice-agent.git
+
+4.配置hermes
+hermes setup
+
+5.注册腾讯云账号，创建仅有语音相关权限的子账号，生成apisecret
+
+6.配置语音助手
+创建hermes-voice-agent/.env
+修改hermes-voice-agent/config.yaml
+下载唤醒词模型（sherpa-onnx）
+
+mkdir -p hermes-voice-agent/models/sherpa-kws
+cd hermes-voice-agent/models/sherpa-kws
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+tar -xf sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+# 会释放到：sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/
+
+
+7.配置pipewire回声消除

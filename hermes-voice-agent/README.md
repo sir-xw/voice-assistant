@@ -1,0 +1,241 @@
+# Hermes Agent 语音输入前端
+
+为 Hermes Agent 增加语音交互能力——**唤醒词唤醒 → 语音识别 → AI 对话 → 语音合成**全链路。
+
+## 架构
+
+```
+麦克风 → PipeWire AEC → Sherpa-onnx(唤醒词) → WebRTC VAD → 腾讯云ASR
+                                                              ↓
+扬声器 ← 腾讯云TTS ← Hermes Agent ←───────────────────────────┘
+```
+
+- **唤醒词检测**：sherpa-onnx KWS（始终监听）
+- **语音活动检测**：WebRTC VAD（对话窗口期内启动 ASR）
+- **语音识别**：腾讯云实时 ASR（WebSocket）
+- **对话引擎**：Hermes Agent（嵌入运行）
+- **语音合成**：腾讯云 TTS
+- **回声消除**：系统级 PipeWire（非软件 AEC）
+
+## 快速开始
+
+### 1. 安装 Hermes Agent
+
+参考 [Hermes Agent 官方安装指南](https://github.com/NousResearch/hermes-agent)：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+```
+
+### 2. 安装 Python 依赖
+
+在 Hermes Agent 的 uv 虚拟环境中安装：
+
+```bash
+source /usr/local/lib/hermes-agent/venv/bin/activate
+sudo apt install libportaudio-ocaml-dev  # PortAudio 编译依赖
+pip install -r requirements.txt
+```
+
+### 3. 配置凭据
+
+项目根目录下创建 `.env`：
+
+```env
+# 腾讯云语音识别/合成（必填）
+# 登录 https://console.cloud.tencent.com/cam/capi 创建子账号
+VOICE_SecretId=AKIDxxxxxxxx
+VOICE_SecretKey=xxxxxxxx
+VOICE_AppId=125922xxxx
+```
+
+### 4. 下载唤醒词模型
+
+```bash
+mkdir -p models/sherpa-kws
+cd models/sherpa-kws
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+tar -xf sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+```
+
+### 5. 配置音频设备
+
+```bash
+# 查看可用音频设备
+python -c "import sounddevice; print(sounddevice.query_devices())"
+```
+
+确认默认输入（麦克风）和输出（扬声器）设备正确。
+
+### 6. 运行
+
+```bash
+python -u src/main.py
+```
+
+说出唤醒词（默认 `赫尔墨斯`）开始对话。
+
+---
+
+## Linux 部署手册
+
+### 系统要求
+
+- **Hermes Agent**（通过官方安装脚本部署）
+- **Python ≥ 3.11**（Hermes Agent uv 环境自带）
+- **PortAudio**（sounddevice 依赖）
+- **PipeWire**（系统级回声消除）
+- **音频设备**（需有可用的麦克风和扬声器）
+
+### 步骤
+
+#### 1. 部署 Hermes Agent
+
+```bash
+# 官方推荐方式安装
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+
+# 后续 Python 操作在 Hermes Agent 的 uv 环境中进行
+source /usr/local/lib/hermes-agent/venv/bin/activate
+```
+
+#### 2. 安装系统依赖
+
+**Ubuntu/Debian：**
+
+```bash
+sudo apt update && sudo apt install -y \
+    portaudio19-dev           \
+    libsndfile1-dev           \
+    build-essential cmake     \
+    pipewire pipewire-pulse   \  # AEC
+    libspa-0.2-modules        \  # PipeWire 回声消除模块
+    alsa-utils pavucontrol
+```
+
+#### 3. 部署语音助手代码
+
+```bash
+git clone <your-repo-url> hermes-voice-agent
+cd hermes-voice-agent
+source /usr/local/lib/hermes-agent/venv/bin/activate
+pip install -r requirements.txt
+```
+
+#### 4. 配置腾讯云凭据
+
+```bash
+# 注册腾讯云账号，创建仅有语音权限的子账号
+# 获取 SecretId / SecretKey / AppId
+# 填写到项目根目录的 .env 文件
+```
+
+参见上方「快速开始」第 3 步。
+
+#### 5. 下载唤醒词模型
+
+```bash
+mkdir -p models/sherpa-kws
+cd models/sherpa-kws
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+tar -xf sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+# 释放到：sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/
+```
+
+#### 6. 配置 PipeWire 回声消除
+
+```bash
+# 安装 PipeWire 及其回声消除模块（步骤 2 中已安装）
+# 确认 PipeWire 运行中
+systemctl --user status pipewire
+```
+
+
+#### 7. 作为 systemd 服务运行
+
+```ini
+# /etc/systemd/system/hermes-voice.service
+[Unit]
+Description=Hermes Agent Voice Frontend
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+User=your_user
+WorkingDirectory=/path/to/hermes-voice-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -u src/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now hermes-voice.service
+sudo journalctl -u hermes-voice -f  # 查看日志
+```
+
+---
+
+## 配置说明
+
+全部配置在 `config.yaml` 中，关键项：
+
+| 配置路径 | 默认值 | 说明 |
+|----------|--------|------|
+| `wake_word.keyword` | `赫尔墨斯` | 唤醒词文本 |
+| `wake_word.threshold` | `0.5` | KWS 检测阈值（越高越严格） |
+| `wake_word.score` | `1.0` | KWS 关键词加分 |
+| `wake_word.model.dir` | `models/sherpa-kws` | KWS 模型目录（相对项目根） |
+| `wake_word.model.name` | `sherpa-onnx-kws-...` | KWS 模型子目录名 |
+| `vad.mode` | `3` | VAD 灵敏度（0-3，3 最敏感） |
+| `vad.silence_threshold_ms` | `1000` | 静音超时（ms） |
+| `vad.speech_confirm_frames` | `3` | 语音确认所需连续帧数 |
+| `asr.engine_model` | `16k_zh` | 腾讯云 ASR 引擎模型 |
+| `tts.voice_type` | `101001` | TTS 音色 ID |
+| `hermes_agent.model` | `deepseek-v4-flash` | 对话模型 |
+| `conversation_window.timeout_sec` | `8.0` | 连续对话窗口（秒） |
+
+## 测试脚本
+
+| 脚本 | 用途 |
+|------|------|
+| `tests/test_sherpa_kws.py` | sherpa-onnx 唤醒词测试（麦克风） |
+| `tests/test_sherpa_asr.py` | sherpa-onnx ASR 识别测试（文件/麦克风） |
+| `tests/test_sherpa_tts.py` | sherpa-onnx TTS 合成测试 |
+| `tests/test_tencent_asr.py` | 腾讯云 ASR 端到端测试（需凭据） |
+
+## 工具脚本
+
+| 脚本 | 用途 |
+|------|------|
+| `tools/tts_gen.py` | 文本→语音（生成 assets 提示音 WAV） |
+| `tools/measure_delay.py` | 扬声器→麦克风延迟探测（PipeWire 延迟调优） |
+
+## 文件结构
+
+```
+├── src/                      # 核心代码
+│   ├── main.py               # 入口：组装全链路、回调绑定
+│   ├── voice_frontend.py     # 麦克风采集 + 唤醒词 + VAD + 状态机
+│   ├── asr_engine.py         # 腾讯云 ASR 引擎（WebSocket）
+│   ├── tts_engine.py         # 腾讯云 TTS 引擎
+│   ├── audio_player.py       # PCM 音频播放器
+│   └── config.py             # 配置加载（YAML + .env + 默认值）
+├── tools/                    # 工具脚本
+├── tests/                    # 测试脚本
+├── assets/                   # 提示音 WAV（prompt / notification / farewell）
+├── models/                   # 第三方模型（sherpa-onnx KWS / ASR / TTS）
+├── config.yaml               # 应用配置
+├── .env                      # 腾讯云凭据（不入库）
+└── requirements.txt          # Python 依赖
+``````
+
+## 鸣谢
+
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — AI 代理框架
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — 语音处理框架
+- [腾讯云语音识别/合成 SDK](https://github.com/TencentCloud/tencentcloud-speech-sdk-python)
