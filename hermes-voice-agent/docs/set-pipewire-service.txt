@@ -1,0 +1,11 @@
+如果是作为root启动，我们需要允许root用户启动pipewire相关服务：
+systemctl edit --user --full pipewire.service
+删除或注释掉 ConditionUser=!root 这一行
+systemctl edit --user --full pipewire-pulse.service
+删除或注释掉 ConditionUser=!root 这一行
+
+systemctl --user daemon-reload
+systemctl --user start wireplumber pipewire pipewire-pulse
+
+为了同步usb音箱的音量调节功能，要启动事件监控服务，根据USB-HID发送的音量+-信号执行音量设置命令，注意根据实际修改设备名称
+tools/volume_ctrl_new.py

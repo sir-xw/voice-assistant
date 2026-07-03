@@ -449,14 +449,14 @@ class VoiceFrontend:
             self._speech_confirm_counter += 1
             self._silence_counter = 0
 
-            if self._speech_confirm_counter >= self._speech_confirm_threshold:
+            if self._was_speech or self._speech_confirm_counter >= self._speech_confirm_threshold:
                 if not self._was_speech:
                     # 首次确认语音开始：将环形缓冲中的音频送入 ASR
                     logger.info("VAD: speech confirmed, flushing ring buffer")
                     self._flush_ring_buffer_to_asr()
                     if self._state != VoiceState.RECORDING:
                         self._start_recording()
-                self._was_speech = True
+                    self._was_speech = True
                 self._feed_to_asr(pcm_bytes)
         else:
             self._speech_confirm_counter = 0
