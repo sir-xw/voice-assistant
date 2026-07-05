@@ -1,0 +1,21 @@
+[Unit]
+Description=Hermes Voice Agent - 语音助手主服务（唤醒词 + ASR + Agent + TTS）
+After=network-online.target pipewire.service pipewire-pulse.service
+Wants=network-online.target
+Requires=pipewire-pulse.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/git/voice-assistant/hermes-voice-agent
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python3 -u src/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target

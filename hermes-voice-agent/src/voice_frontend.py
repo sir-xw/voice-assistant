@@ -79,6 +79,9 @@ class VoiceFrontendConfig:
     on_play_prompt: Callable[[], None] | None = None
     prompt_duration_sec: float = 1.0  # 提示音实际时长秒，由 main.py 传入
 
+    # 会话超时回调：连续对话窗口过期时触发，提醒用户需重新说唤醒词
+    on_conversation_timeout: Callable[[], None] | None = None
+
 
 def _split_pinyin_syllable(syllable: str) -> str:
     """
@@ -226,6 +229,15 @@ class VoiceFrontend:
 
     def enter_conversation_window(self):
         """TTS 播放完毕后调用，进入连续对话窗口期。"""
+        if self._state == VoiceState.CONVERSATION:
+            # 已在窗口内：续期 timer（快速连续对话场景）
+            self._cancel_conversation_timer()
+            self._conversation_timer = threading.Timer(
+                self._conversation_window_sec, self._on_conversation_timeout
+            )
+            self._conversation_timer.daemon = True
+            self._conversation_timer.start()
+            return
         if self._state != VoiceState.IDLE:
             return
         self._cancel_conversation_timer()
@@ -240,10 +252,16 @@ class VoiceFrontend:
         logger.info(f"Conversation window started ({self._conversation_window_sec}s)")
 
     def _on_conversation_timeout(self):
-        """连续对话窗口超时，回到待机。"""
+        """连续对话窗口超时，回到待机。触发超时回调提醒用户。"""
         self._cancel_conversation_timer()
         self._set_state(VoiceState.IDLE)
         logger.info("Conversation window expired, need wake word")
+        # 触发超时回调（如播放提示音，提醒用户需说唤醒词）
+        if self.config.on_conversation_timeout:
+            try:
+                self.config.on_conversation_timeout()
+            except Exception:
+                logger.exception("on_conversation_timeout callback error")
 
     def _cancel_conversation_timer(self):
         if self._conversation_timer:

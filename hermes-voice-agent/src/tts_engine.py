@@ -36,7 +36,7 @@ class TencentTTSConfig:
     codec: str = "pcm"              # pcm | mp3
     sample_rate: int = 16000
     speed: float = 0.0              # -2~6
-    volume: float = 0.0             # -10~10
+    volume: float = 10.0            # -10~10，为了和音乐音量匹配，设置为最大，靠全局音量来共同调节
 
 
 class _TTSListener(FlowingSpeechSynthesisListener):

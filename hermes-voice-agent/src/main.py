@@ -163,6 +163,7 @@ class VoiceApp:
             on_interrupt_request=self._on_interrupt_request,
             prompt_duration_sec=self._get_prompt_duration_sec(),
             on_play_prompt=self._on_play_prompt,
+            on_conversation_timeout=lambda: self._play_asset("farewell"),
         )
         self.frontend = VoiceFrontend(frontend_config, self.asr_engine)
         self.frontend.start()

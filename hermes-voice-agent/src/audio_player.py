@@ -177,6 +177,7 @@ class AudioPlayer:
                 dtype=self.config.dtype,
                 blocksize=self.config.blocksize,
                 latency="low",
+                device="pulse",
             )
             self._stream.start()
 

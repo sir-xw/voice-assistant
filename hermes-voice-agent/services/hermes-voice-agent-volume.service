@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes Voice Agent - USB 音箱音量控制（触摸按键松手后执行）
+After=pipewire.service pipewire-pulse.service
+Requires=pipewire-pulse.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/git/voice-assistant/hermes-voice-agent
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python3 -u tools/volume_ctrl_new.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target
