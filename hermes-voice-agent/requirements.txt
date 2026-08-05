@@ -16,3 +16,6 @@ python-dotenv>=1.0.0
 pypinyin==0.55.0
 sherpa-onnx
 webrtcvad
+
+# MPD 音乐播放控制（mpd_tool）
+python-mpd2>=3.1.1

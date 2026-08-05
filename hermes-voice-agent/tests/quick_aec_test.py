@@ -91,6 +91,7 @@ def record_vad(vad_timeout: float = 1.0, vad_mode: int = 3, max_duration: float 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE, channels=1, dtype="int16",
         blocksize=FRAME_SIZE, latency="low", callback=cb,
+        device="pulse",
     )
     stream.start()
     print(f"\n🎤 录音（静音 {vad_timeout}s 自动停）...  请说话", end="")
@@ -156,12 +157,13 @@ def test_aec(source_path: str, volume: float = 1.0, out_dir: str = ".", record_m
     rec = sd.InputStream(
         samplerate=SAMPLE_RATE, channels=1, dtype="int16",
         blocksize=FRAME_SIZE, latency="low", callback=rec_cb,
+        device="pulse",
     )
     rec.start()
     rec_ready.wait(2)
 
     audio_out = (source.astype(np.float32) * volume).astype(np.int16)
-    sd.play(audio_out, SAMPLE_RATE)
+    sd.play(audio_out, SAMPLE_RATE, device="pulse",)
     sd.wait()
 
     time.sleep(0.3)
@@ -181,7 +183,7 @@ def test_aec(source_path: str, volume: float = 1.0, out_dir: str = ".", record_m
     print(f"{'=' * 50}")
     print("\n▶ 正在播放...")
     time.sleep(0.5)
-    sd.play(raw, SAMPLE_RATE)
+    sd.play(raw, SAMPLE_RATE, device="pulse",)
     sd.wait()
 
     # === 汇总 ===

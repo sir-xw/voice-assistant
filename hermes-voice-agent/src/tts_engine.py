@@ -37,6 +37,8 @@ class TencentTTSConfig:
     sample_rate: int = 16000
     speed: float = 0.0              # -2~6
     volume: float = 10.0            # -10~10，为了和音乐音量匹配，设置为最大，靠全局音量来共同调节
+    emotion_category: str = ""      # 情绪/风格：neutral(中性) sad(悲伤) happy(高兴) angry(生气) fear(恐惧) story(故事) poetry(诗歌) sajiao(撒娇) disgusted(厌恶) amaze(震惊) exciting(兴奋) aojiao(傲娇) jieshuo(解说)
+    emotion_intensity: int = 100    # 情绪强度 0-100，默认100
 
 
 class _TTSListener(FlowingSpeechSynthesisListener):
@@ -112,6 +114,19 @@ class TencentCloudTTSEngine:
         self.on_end: Callable[[], None] | None = None
         self.on_error: Callable[[str], None] | None = None
 
+    def set_emotion(self, category: str, intensity: int = 100):
+        """
+        动态设置本次合成的情绪/风格（需在 start() 之后、synthesize() 之前调用）。
+
+        Args:
+            category: 情绪类别
+            intensity: 情绪强度 0-200
+        """
+        if self._synthesizer and category:
+            self._synthesizer.set_emotion_category(category)
+            self._synthesizer.set_emotion_intensity(intensity)
+            logger.info("TTS emotion set: %s (intensity=%d)", category, intensity)
+
     # ─── 公共 API ────────────────────────────────────────
 
     def start(self):
@@ -133,6 +148,13 @@ class TencentCloudTTSEngine:
         s.set_speed(self.config.speed)
         s.set_volume(self.config.volume)
         s.set_enable_subtitle(0)  # 不需要时间戳
+
+        # 设置情绪/风格
+        if self.config.emotion_category:
+            s.set_emotion_category(self.config.emotion_category)
+            s.set_emotion_intensity(self.config.emotion_intensity)
+            logger.info("TTS emotion: %s (intensity=%d)",
+                        self.config.emotion_category, self.config.emotion_intensity)
 
         s.start()
 

@@ -58,6 +58,7 @@ def tts_to_file(
     volume: float = 0.0,
     sample_rate: int = 16000,
     codec: str = "pcm",
+    emotion: str = "",
     timeout: float = 20.0,
 ):
     """
@@ -102,6 +103,8 @@ def tts_to_file(
     synthesizer.set_speed(speed)
     synthesizer.set_volume(volume)
     synthesizer.set_enable_subtitle(0)
+    if emotion:
+        synthesizer.set_emotion_category(emotion)
 
     # 启动
     synthesizer.start()
@@ -181,6 +184,9 @@ def main():
                         help="采样率（默认 16000）")
     parser.add_argument("--codec", default="pcm", choices=["pcm", "mp3"],
                         help="输出格式（默认 pcm=wav）")
+    parser.add_argument("--emotion",
+                        help="语音情绪/风格，可选：neutral sad happy angry fear "
+                             "story poetry sajiao disgusted amaze exciting aojiao jieshuo")
 
     args = parser.parse_args()
 
@@ -192,6 +198,7 @@ def main():
         volume=args.volume,
         sample_rate=args.sample_rate,
         codec=args.codec,
+        emotion=args.emotion or "",
     )
 
 

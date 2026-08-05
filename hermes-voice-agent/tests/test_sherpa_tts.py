@@ -224,7 +224,7 @@ def _play_audio(samples: np.ndarray, sample_rate: int):
     try:
         import sounddevice as sd
         logger.info("🔊 播放中...")
-        sd.play(samples, samplerate=sample_rate)
+        sd.play(samples, samplerate=sample_rate, device='pulse')
         sd.wait()
     except ImportError:
         logger.warning("sounddevice 未安装，无法播放")

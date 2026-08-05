@@ -15,8 +15,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+import os
 
 logger = logging.getLogger(__name__)
+
+# set fixed pulse client name
+os.environ['PULSE_CLIENTNAME'] = 'hermes-voice-agent'
 
 
 class PlayerState(Enum):

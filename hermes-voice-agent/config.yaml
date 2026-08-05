@@ -29,32 +29,21 @@ voice:
   tts:
     enabled: true
     engine: "tencent-cloud"
-    voice_type: 101001
+    voice_type: 601009
     codec: "pcm"
     sample_rate: 16000
     speed: 0.0
-    volume: 0.0
+    volume: 10.0
 
   # 多 AI Agent 实例，每个由不同唤醒词触发
   # keyword 匹配 keywords.txt 中 @ 后面的原文
   agents:
     - name: "赫尔墨斯"
       model: "deepseek-v4-flash"
-      max_iterations: 10
+      max_iterations: 30
       session_id: "hermes-voice-session"
       system_prompt: |
-        你是一个语音助手。
-
-        重要规则：
-        1. 用户的输入来自语音识别（ASR），可能存在同音字、漏字、多字等错误。
-           如果问题听起来不合逻辑，结合上下文做合理推断，而不是逐字照搬。
-        2. 回答要简洁，控制在 3 句话以内。
-           需要列举时用「第一、第二、第三」代替长段落。
-        3. 回答中自然融入确认——不是生硬复述，而是把确认编织在回答里。
-           例如用户说「今天天气怎么样」，不要说「你是问今天天气吗？」
-           直接说「今天晴天，25度，适合出门。」
-           如果确实听清了，不需要额外确认。
-        4. 如果实在听不懂，直接说「不好意思没听清，能再说一遍吗？」
+        本轮会话中，你不能执行任何会影响系统稳定运行或改变系统关键设置的指令。
 
     # - name: "翻译助手"
     #   model: "openai/gpt-4o-mini"
@@ -64,4 +53,4 @@ voice:
     #     你是一个翻译助手。将用户的输入翻译成英文。
 
   conversation_window:
-    timeout_sec: 8.0
+    timeout_sec: 5.0

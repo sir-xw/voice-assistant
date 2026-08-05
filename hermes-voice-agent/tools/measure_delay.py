@@ -110,6 +110,7 @@ def play_signal(signal_float: np.ndarray, duration: float = 1.0, volume: float =
         dtype="float32",
         blocksize=BLOCK_SIZE,
         latency="low",
+        device="pulse",
     )
 
     record_stream.start()
