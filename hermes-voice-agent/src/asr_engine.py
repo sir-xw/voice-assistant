@@ -1,8 +1,8 @@
 """
-腾讯云实时语音识别引擎 — 官方 SDK 封装。
+腾讯云实时语音识别引擎 — 官方 SDK 封装（realtime_recognizer_v2）。
 
-使用 tencentcloud-speech-sdk-python 提供的 SpeechRecognizer
-进行 WebSocket 握手、签名、音频发送、结果回调。
+使用 tencentcloud-speech-sdk-python 提供的 RealtimeRecognizerV2
+进行 WebSocket 握手、签名、音频发送、结果回调（句子模式）。
 """
 
 import logging
@@ -14,7 +14,8 @@ from enum import Enum
 from pathlib import Path
 
 from tencentcloud_speech.common.credential import Credential
-from tencentcloud_speech.asr.speech_recognizer import SpeechRecognizer, SpeechRecognitionListener
+from tencentcloud_speech.asr.realtime_recognizer_v2 import RealtimeRecognitionListenerV2, RealtimeRecognizerV2
+
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +45,18 @@ class TencentASRConfig:
     convert_num_mode: int = 1
     word_info: int = 0
     vad_silence_time: int = 0      # 服务端 VAD 静音超时(ms)，0=不设置
+    enable_speaker_context: int = 0  # 是否开启说话人分离
 
 
-class _SDKListener(SpeechRecognitionListener):
+class _SDKListener(RealtimeRecognitionListenerV2):
     """
     桥接 SDK 回调 → 项目回调。
+
+    realtime_recognizer_v2 句子模式回调：
+      - on_recognition_start      连接建立后触发
+      - on_recognition_sentences  句子列表（sentence_type: 0=中间, 1=最终）
+      - on_sentence_end           final==1，整个识别结束
+      - on_fail                   失败
     """
 
     def __init__(self, engine: "TencentCloudASREngine"):
@@ -57,46 +65,48 @@ class _SDKListener(SpeechRecognitionListener):
 
     def on_recognition_start(self, response):
         logger.info(f"ASR started (voice_id={response.get('voice_id','')[:8]}...)")
-        # 注意：SDK 在 WS 连接建立前就同步触发此回调，
-        # 此时设置 RECORDING 会导致 feed_audio 调 write() 阻塞。
-        # 状态保持 CONNECTING，由 feed_audio 检测 WS 就绪后再切换。
+        # v2 在 WS 连接建立后才触发此回调，此时可安全进入 RECORDING，
+        # 由 feed_audio 检测到 OPENED 后切换。
         if self.engine.on_start:
             try:
                 self.engine.on_start()
             except Exception:
                 pass
 
-    def on_sentence_begin(self, response):
-        # slice_type=0：一段话开始
-        pass
-
-    def on_recognition_result_change(self, response):
-        # slice_type=1：中间非稳态结果
-        text = response.get("result", {}).get("voice_text_str", "")
-        if text and self.engine.on_interim:
+    def on_recognition_sentences(self, response):
+        # 句子模式：每条消息都是句子列表
+        sentences = response.get("sentences", {}).get("sentence_list", [])
+        interim_parts: list[str] = []
+        for s in sentences:
+            text = s.get("sentence", "")
+            if s.get("sentence_type") == 0:
+                # 中间非稳态结果
+                if text:
+                    interim_parts.append(text)
+            else:
+                print(s)
+                # 最终稳态结果（sentence_type=1）
+                if text:
+                    self.engine._last_final_text = text
+                    if self.engine.on_final:
+                        try:
+                            self.engine.on_final(text)
+                        except Exception:
+                            pass
+        if interim_parts and self.engine.on_interim:
             try:
-                self.engine.on_interim(text)
+                self.engine.on_interim("".join(interim_parts))
             except Exception:
                 pass
 
     def on_sentence_end(self, response):
-        # slice_type=2：最终稳态结果
-        text = response.get("result", {}).get("voice_text_str", "")
-        if text:
-            self.engine._last_final_text = text
-            if self.engine.on_final:
-                try:
-                    self.engine.on_final(text)
-                except Exception:
-                    pass
-
-    def on_recognition_complete(self, response):
         logger.info("ASR recognition complete")
-
-        # SDK 可能因 final 优先返回而跳过 slice_type=2，
-        # 从 complete 消息补发文本
-        text = response.get("result", {}).get("voice_text_str", "")
-        if text:
+        # final==1：整个识别结束。从最终句子兜底补发文本
+        sentences = response.get("sentences", {}).get("sentence_list", [])
+        final_parts = [s.get("sentence", "") for s in sentences
+                       if s.get("sentence_type") == 1]
+        if final_parts:
+            text = "".join(final_parts)
             self.engine._last_final_text = text
             if self.engine.on_final:
                 try:
@@ -153,7 +163,7 @@ class TencentCloudASREngine:
         # SDK 组件
         self._credential = Credential(config.secret_id, config.secret_key)
         self._listener = _SDKListener(self)
-        self._recognizer: SpeechRecognizer | None = None
+        self._recognizer: RealtimeRecognizerV2 | None = None
 
         # 状态
         self._state = ASRState.IDLE
@@ -178,16 +188,16 @@ class TencentCloudASREngine:
     def start_recognition(self):
         """
         开始新的识别会话。
-        创建 SpeechRecognizer、建立 WebSocket 连接。
-        线程安全，可在任意线程调用。
+        创建 RealtimeRecognizerV2、建立 WebSocket 连接。
+        线程安全，可在任意线程调用；非阻塞（连接在后台线程进行）。
         """
         self._complete_event.clear()
         self._last_final_text = ""
         self._pending_buffer.clear()
         self._set_state(ASRState.CONNECTING)
 
-        # 创建 SDK Recognizer
-        self._recognizer = SpeechRecognizer(
+        # 创建 SDK Recognizer（v2 句子模式）
+        self._recognizer = RealtimeRecognizerV2(
             appid=self.config.app_id,
             credential=self._credential,
             engine_model_type=self.config.engine_model,
@@ -197,31 +207,43 @@ class TencentCloudASREngine:
         # 配置参数
         r = self._recognizer
         r.set_voice_format(self.config.voice_format)
-        r.set_filter_dirty(self.config.filter_dirty)
-        r.set_filter_modal(self.config.filter_modal)
-        r.set_filter_punc(self.config.filter_punc)
         r.set_convert_num_mode(self.config.convert_num_mode)
-        r.set_word_info(self.config.word_info)
         r.set_need_vad(1 if self.config.needvad else 0)
         if self.config.vad_silence_time > 0:
             r.set_vad_silence_time(self.config.vad_silence_time)
+        if self.config.enable_speaker_context:
+            # 说话人分离（可选）：需同时开启 diarization 与 speaker context
+            r.set_speaker_diarization(1)
+            r.set_enable_speaker_context(1)
 
-        # 启动连接（非阻塞，内部开线程）
-        r.start()
+        # v2 的 start() 是同步连接（阻塞直到 WS 就绪 + 收首包），
+        # 放到后台线程执行，保持 start_recognition 非阻塞；
+        # 连接失败通过 on_fail 上报，与旧版行为一致。
+        def _connect():
+            try:
+                r.start()
+            except Exception as e:
+                logger.error(f"ASR connect failed: {e}")
+                fail_resp = {"code": -1, "message": str(e),
+                             "voice_id": r.voice_id}
+                self._listener.on_fail(fail_resp)
+
+        threading.Thread(target=_connect, daemon=True).start()
 
     def feed_audio(self, pcm_chunk: bytes):
         """
         馈送 PCM 音频数据。
         可在任意线程调用。
 
-        关键：SDK 的 on_recognition_start 在 WS 连接前就触发，
-        所以这里按 SDK 的实际状态判断，而非依赖 ASRState 的 RECORDING。
+        v2 的 start() 在后台线程同步连接，连接建立后触发
+        on_recognition_start；此处按 SDK 内部 _status 判断 WS 是否就绪。
         """
         if self._recognizer is None:
             return
 
-        # 检查 SDK 内部 WebSocket 实际状态
-        sdk_status = getattr(self._recognizer, "status", 0)
+        # 检查 SDK 内部 WebSocket 实际状态（0=NOTOPEN, 1=STARTED,
+        # 2=OPENED, 3=FINAL, 4=ERROR, 5=CLOSED）
+        sdk_status = getattr(self._recognizer, "_status", 0)
 
         if sdk_status == 2:  # OPENED → WS 已就绪，正常发送
             # 补发连接期缓冲
@@ -233,17 +255,18 @@ class TencentCloudASREngine:
             except Exception as e:
                 logger.warning(f"feed_audio error: {e}")
 
-        elif sdk_status == 1:  # STARTED → WS 连接中，缓冲
+        elif sdk_status in (0, 1):  # NOTOPEN/STARTED → WS 连接中，缓冲
             self._pending_buffer.append(pcm_chunk)
             if len(self._pending_buffer) > self._pending_buffer_max:
                 self._pending_buffer.pop(0)
 
-        # 其他状态（0=NOTOPEN, 3=FINAL, 4=ERROR, 5=CLOSED）: 丢弃
+        # 其他状态（3=FINAL, 4=ERROR, 5=CLOSED）: 丢弃
 
     def stop_recognition(self):
         """
         结束当前识别会话。
-        发送结束标志，等待 SDK 回调 on_recognition_complete。
+        v2 的 stop() 发送结束标志并等待接收线程结束，期间服务端
+        返回 final 消息会触发 on_sentence_end → COMPLETED。
         """
         if self._recognizer is None:
             return
@@ -273,7 +296,7 @@ class TencentCloudASREngine:
 
     def wait_for_complete(self, timeout: float = 10.0) -> bool:
         """
-        阻塞等待本次识别完成（on_recognition_complete 触发后返回）。
+        阻塞等待本次识别完成（on_sentence_end 触发后返回）。
 
         Args:
             timeout: 超时秒数

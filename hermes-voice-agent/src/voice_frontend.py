@@ -20,6 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
+from vad import has_confirmed_run, init_vad, is_speech_frame
+
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
@@ -169,12 +171,17 @@ class VoiceFrontend:
         self._min_speech_frames = config.min_speech_ms // config.frame_duration_ms
         # 静音超时相关
         self._silence_threshold_frames = config.vad_silence_threshold_ms // config.frame_duration_ms
-        self._silence_counter = 0
         # 语音开始确认
         self._speech_confirm_counter = 0
         self._speech_confirm_threshold = config.vad_speech_confirm_frames
         # 标记是否已进入语音状态（用于静音超时）
         self._was_speech = False
+        # 最近 _silence_threshold_frames 帧的 is_speech 标记滑动窗口（maxlen 自动
+        # 丢弃最旧帧）：窗口内存在连续确认语音帧才视为对话进行中；孤立的噪音帧
+        # 不足确认帧连续，不会重置静音计时，避免对话窗口被噪音无限延长
+        self._recent_vad_flags: collections.deque = collections.deque(
+            maxlen=max(self._silence_threshold_frames, self._speech_confirm_threshold)
+        )
 
         # 音频流
         self._audio_stream = None
@@ -282,21 +289,14 @@ class VoiceFrontend:
 
     # VAD
     def _init_vad(self):
-        try:
-            import webrtcvad
-            self._vad = webrtcvad.Vad(self.config.vad_mode)
-            logger.info(f"WebRTC VAD initialized (mode={self.config.vad_mode})")
-        except ImportError:
+        self._vad = init_vad(self.config.vad_mode)
+        if self._vad is None:
             logger.warning("webrtcvad not installed")
-            self._vad = None
+        else:
+            logger.info(f"WebRTC VAD initialized (mode={self.config.vad_mode})")
 
     def _is_speech(self, pcm_frame: bytes) -> bool:
-        if self._vad is None:
-            return True
-        try:
-            return self._vad.is_speech(pcm_frame, SAMPLE_RATE)
-        except Exception:
-            return False
+        return is_speech_frame(self._vad, pcm_frame, SAMPLE_RATE)
 
     # 唤醒词（sherpa-onnx）
     def _init_wake_word(self):
@@ -458,15 +458,16 @@ class VoiceFrontend:
         带静音超时和语音开始确认的 VAD 处理。
 
         语音开始：需要连续 _speech_confirm_threshold 帧检测到语音才确认。
-        语音结束：检测到静音后进入静音超时计数，超过 _silence_threshold_frames
-                 才认为语音真正结束。
+        语音结束：基于滑动窗口的连续确认帧判定（与 tests/ 共用 vad.has_confirmed_run）——
+          最近 _silence_threshold_frames 帧内只要存在连续确认语音帧就认为对话仍在
+          进行；只有窗口内不再存在连续确认帧时才结束。孤立的噪音帧不足确认帧连续，
+          不会重置静音计时，避免对话窗口被噪音无限延长。
         """
         is_speech = self._is_speech(pcm_bytes)
+        self._recent_vad_flags.append(is_speech)
 
         if is_speech:
             self._speech_confirm_counter += 1
-            self._silence_counter = 0
-
             if self._was_speech or self._speech_confirm_counter >= self._speech_confirm_threshold:
                 if not self._was_speech:
                     # 首次确认语音开始：将环形缓冲中的音频送入 ASR
@@ -479,18 +480,17 @@ class VoiceFrontend:
         else:
             self._speech_confirm_counter = 0
             if self._was_speech:
-                # 语音中遇到静音：进入静音超时计数
-                self._silence_counter += 1
+                # 语音中遇到静音：继续送帧（保持 ASR 尾部处理）
                 self._feed_to_asr(pcm_bytes)
-                if self._silence_counter >= self._silence_threshold_frames:
+                # 结束判定：窗口内不再存在连续确认语音帧 → 语音已结束。
+                # 孤立噪音帧不足确认帧连续，不会阻止结束
+                if not has_confirmed_run(self._recent_vad_flags, self._speech_confirm_threshold):
                     logger.info("VAD: silence threshold expired, speech ended")
                     self._was_speech = False
-                    self._silence_counter = 0
+                    self._speech_confirm_counter = 0
+                    self._recent_vad_flags.clear()
                     if self._state == VoiceState.RECORDING:
                         self._stop_recording()
-            else:
-                # 非语音状态，静音帧不做处理
-                pass
 
     def _flush_ring_buffer_to_asr(self):
         """
@@ -511,7 +511,7 @@ class VoiceFrontend:
         self._speech_start_time = None
         self._consecutive_silence_frames = 0
         self._was_speech = False
-        self._silence_counter = 0
+        self._recent_vad_flags.clear()
         self._speech_confirm_counter = 0
 
         self.interrupt()
@@ -582,5 +582,5 @@ class VoiceFrontend:
                 self._speech_start_time = None
                 self._consecutive_silence_frames = 0
                 self._was_speech = False
-                self._silence_counter = 0
+                self._recent_vad_flags.clear()
                 self._speech_confirm_counter = 0

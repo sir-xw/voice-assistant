@@ -11,6 +11,7 @@
 
     # 自定义参数
     python -u tests/test_tencent_asr.py --record --vad-timeout 2 --max-duration 30
+    python -u tests/test_tencent_asr.py --record --vad-confirm 3
 
     # 使用已有文件或测试音
     python -u tests/test_tencent_asr.py --file test.wav
@@ -25,12 +26,14 @@ import logging
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from asr_engine import TencentCloudASREngine, TencentASRConfig, ASRState
 from config import load_config
+from vad import has_confirmed_run, init_vad, is_speech_frame
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,12 +92,14 @@ def make_engine(engine_model="16k_zh", needvad=False):
 
     cfg = TencentASRConfig(
         secret_id=sid, secret_key=skey, app_id=appid,
-        engine_model=engine_model, needvad=needvad, voice_format=1,
+        engine_model=engine_model or '16k_zh', needvad=needvad, voice_format=1,
+        enable_speaker_context=0,
     )
     return TencentCloudASREngine(cfg)
 
 
-def run_vad_live(vad_timeout=1.0, max_dur=30.0, vad_mode=3):
+def run_vad_live(vad_timeout=1.0, max_dur=30.0, vad_mode=3, model=None,
+                 speech_confirm_frames=3):
     """
     VAD 录音 + 实时 ASR 识别。
 
@@ -102,25 +107,30 @@ def run_vad_live(vad_timeout=1.0, max_dur=30.0, vad_mode=3):
       1. VAD 判断是否有人声
       2. 累积到 6400 字节后通过 feed_audio 发送
 
-    连续静音超过 vad_timeout 秒 → 结束。
+    结束判定与 test_sherpa_asr.py 一致，基于滑动窗口：
+      最近 vad_timeout 秒内只要存在连续 speech_confirm_frames 个语音帧就视为对话
+      进行中；孤立的噪音帧不足 confirm_frames 帧连续，不会重置静音计时，避免
+      对话窗口被噪音无限延长、增加 ASR 延迟。
     收到 on_complete 回调 → threading.Event 放行。
     """
     import sounddevice as sd
-    import webrtcvad
     import numpy as np
 
-    vad = webrtcvad.Vad(vad_mode)
-    engine = make_engine()
+    vad = init_vad(vad_mode)
+    if vad is None:
+        print("❌ 缺少依赖 webrtcvad\n   pip install sounddevice scipy webrtcvad")
+        return results, time.time() - t0
+    engine = make_engine(engine_model=model)
 
     results = []
     t0 = time.time()
     done_evt = threading.Event()
-    buf = bytearray()
 
     def on_start():
         print("  ✅ ASR 已连接")
 
     def on_interim(text):
+        print_result(("interim", text, time.time() - t0))
         results.append(("interim", text, time.time() - t0))
 
     def on_final(text):
@@ -153,28 +163,30 @@ def run_vad_live(vad_timeout=1.0, max_dur=30.0, vad_mode=3):
         print("❌ 连接失败")
         return results, time.time() - t0
 
-    # 录音回调
-    speech_frames = 0
-    silence_frames = 0
-    speech_started = False
-    limit_silence = int(vad_timeout / (FRAME_MS / 1000))
+    silence_timeout_frames = int(vad_timeout / (FRAME_MS / 1000))
     chunk_buf = bytearray()
+    speech_confirm = 0
+    speech_started = False
+    # 最近 silence_timeout_frames 帧的 is_speech 标记滑动窗口（maxlen 自动丢弃
+    # 最旧帧）：窗口内存在连续 speech_confirm_frames 个 is_speech 帧才视为对话
+    # 进行中；孤立噪音帧不会重置静音计时，避免对话窗口被噪音无限延长
+    recent_flags: deque = deque(maxlen=max(silence_timeout_frames, speech_confirm_frames))
 
     def callback(indata, frames, ti, status):
-        nonlocal speech_frames, silence_frames, speech_started
+        nonlocal speech_confirm, speech_started
 
         pcm = indata.tobytes()
-        is_speech = vad.is_speech(pcm, SAMPLE_RATE)
+        is_speech = is_speech_frame(vad, pcm, SAMPLE_RATE)
+        recent_flags.append(is_speech)
 
         if is_speech:
-            silence_frames = 0
-            speech_frames += 1
-            if not speech_started and speech_frames >= 7:
+            speech_confirm += 1
+            if not speech_started and speech_confirm >= speech_confirm_frames:
+                # 连续确认帧才判定语音开始，避免孤立的噪音帧误触发
                 speech_started = True
                 print("🎤", end="", flush=True)
         else:
-            if speech_started:
-                silence_frames += 1
+            speech_confirm = 0
 
         # 累积到 chunk 发送
         chunk_buf.extend(pcm)
@@ -196,9 +208,14 @@ def run_vad_live(vad_timeout=1.0, max_dur=30.0, vad_mode=3):
             if elapsed >= max_dur:
                 print(f"\n  ⏰ 超时 {max_dur}s")
                 break
-            if speech_started and silence_frames >= limit_silence:
-                actual = silence_frames * FRAME_MS / 1000
-                print(f"\n  🔇 静音 {actual:.1f}s")
+            if speech_started and not has_confirmed_run(recent_flags, speech_confirm_frames):
+                # 最近窗口内不再有连续确认语音帧 → 对话已结束，统计静音时长
+                silent = 0
+                for flag in reversed(recent_flags):
+                    if flag:
+                        break
+                    silent += 1
+                print(f"\n  🔇 静音 {silent * FRAME_MS / 1000:.1f}s")
                 break
             done_evt.wait(0.2)
     except KeyboardInterrupt:
@@ -220,9 +237,9 @@ def run_vad_live(vad_timeout=1.0, max_dur=30.0, vad_mode=3):
     return results, time.time() - t0
 
 
-def run_file(pcm_data, chunk_size=CHUNK_SIZE):
+def run_file(pcm_data, chunk_size=CHUNK_SIZE, model=None):
     """使用已有 PCM 数据识别。"""
-    engine = make_engine()
+    engine = make_engine(engine_model=model)
     results = []
     t0 = time.time()
     done_evt = threading.Event()
@@ -231,6 +248,7 @@ def run_file(pcm_data, chunk_size=CHUNK_SIZE):
         print("  ✅ ASR 已连接")
 
     def on_interim(text):
+        print_result(("interim", text, time.time() - t0))
         results.append(("interim", text, time.time() - t0))
 
     def on_final(text):
@@ -278,6 +296,11 @@ def run_file(pcm_data, chunk_size=CHUNK_SIZE):
     return results, time.time() - t0
 
 
+def print_result(kind, text, t):
+    icon = {"interim": "📝", "final": "✅", "complete": "🏁"}.get(kind, "•")
+    print(f"   {icon} [{t:5.1f}s] {text or kind}")
+
+
 def print_results(results, elapsed):
     print(f"\n{'='*50}")
     print(f"⏱  总耗时: {elapsed:.1f}s")
@@ -285,9 +308,8 @@ def print_results(results, elapsed):
     interims = [r for r in results if r[0] == "interim"]
     print(f"📊 中间: {len(interims)} | 最终: {len(finals)}")
 
-    for kind, text, t in results:
-        icon = {"interim": "📝", "final": "✅", "complete": "🏁"}.get(kind, "•")
-        print(f"   {icon} [{t:5.1f}s] {text or kind}")
+    for kind, text, t in finals:
+        print_result(kind, text, t)
 
     if finals:
         print("\n✅ 测试完成")
@@ -320,6 +342,8 @@ def main():
                    help=f"VAD 模式（默认 {df_vad_mode}，来自 config）")
     p.add_argument("--model", type=str, default=df_model,
                    help=f"引擎模型（默认 {df_model}，来自 config）")
+    p.add_argument("--vad-confirm", type=int, default=3,
+                   help="VAD 语音确认连续帧数（默认 %(default)s）")
     p.add_argument("--save", type=str, metavar="PATH", help="保存录音为 WAV")
 
     args = p.parse_args()
@@ -329,13 +353,13 @@ def main():
         print(f"📂 加载 {args.file}")
         pcm = load_wav_to_pcm(args.file)
         print(f"   长度: {len(pcm)} bytes ({len(pcm)/32000:.1f}s)")
-        results, elapsed = run_file(pcm)
+        results, elapsed = run_file(pcm, model=args.model)
         print_results(results, elapsed)
 
     elif args.sine:
         print(f"🔊 测试音 {args.sine}s")
         pcm = generate_test_pcm(args.sine)
-        results, elapsed = run_file(pcm)
+        results, elapsed = run_file(pcm, model=args.model)
         print_results(results, elapsed)
 
     else:
@@ -351,6 +375,8 @@ def main():
             vad_timeout=args.vad_timeout,
             max_dur=args.max_duration,
             vad_mode=args.vad_mode,
+            model=args.model,
+            speech_confirm_frames=args.vad_confirm,
         )
         print_results(results, elapsed)
 

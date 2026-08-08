@@ -33,8 +33,12 @@ import sys
 import tarfile
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
 from typing import List, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from vad import has_confirmed_run, init_vad, is_speech_frame
 
 import numpy as np
 
@@ -82,7 +86,7 @@ def download_model(model_dir: Path = None) -> Path:
     return model_path
 
 
-def find_model_files(model_path: Path, chunk: int = 16):
+def find_model_files(model_path: Path):
     """查找模型文件（encoder, decoder, joiner, tokens），优先 int8。"""
     enc = model_path / f"encoder-epoch-99-avg-1.onnx"
     enc_int8 = model_path / f"encoder-epoch-99-avg-1.int8.onnx"
@@ -156,30 +160,9 @@ def generate_test_tone(duration_sec: float = 3.0) -> np.ndarray:
 
 # ---------------------------------------------------------------------------
 # VAD 工具（仅用于控制 ASR 生命周期，不过滤音频样本）
-# 与 test_tencent_asr.py 一致：VAD 只决定何时启动/停止 ASR，
+# 与 src/voice_frontend.py 共用 src/vad.py：VAD 只决定何时启动/停止 ASR，
 # 识别期间所有帧全量送入，不做静音去除。
 # ---------------------------------------------------------------------------
-
-def _init_vad(mode: int = 3):
-    """初始化 WebRTC VAD。"""
-    try:
-        import webrtcvad
-        vad = webrtcvad.Vad(mode)
-        logger.info("WebRTC VAD initialized (mode=%d)", mode)
-        return vad
-    except ImportError:
-        logger.warning("webrtcvad not installed, VAD disabled")
-        return None
-
-
-def _is_speech_frame(vad, pcm_int16: bytes) -> bool:
-    """判断一帧 30ms int16 PCM 是否含人声。"""
-    if vad is None:
-        return True
-    try:
-        return vad.is_speech(pcm_int16, SAMPLE_RATE)
-    except Exception:
-        return False
 
 
 
@@ -189,11 +172,11 @@ def _is_speech_frame(vad, pcm_int16: bytes) -> bool:
 # ASR 识别
 # ---------------------------------------------------------------------------
 
-def create_recognizer(model_path: Path, chunk: int = 16, num_threads: int = 2):
+def create_recognizer(model_path: Path, num_threads: int = 2):
     """创建 sherpa-onnx 流式识别器。"""
     import sherpa_onnx
 
-    enc, dec, joi, tok = find_model_files(model_path, chunk)
+    enc, dec, joi, tok = find_model_files(model_path / MODEL_NAME)
     logger.info("加载模型:")
     logger.info("  编码器: %s", enc)
     logger.info("  解码器: %s", dec)
@@ -359,14 +342,18 @@ def recognize_microphone_vad(recognizer, vad_mode: int = 3,
     麦克风 VAD 录音识别。
 
     使用 WebRTC VAD 检测人声，仅在说话时送入 sherpa-onnx 识别。
-    静音超过 silence_timeout_ms 后自动停止本轮 ASR，等待下次说话。
+    最近 silence_timeout_ms 内不再出现连续确认语音帧后自动停止本轮 ASR，
+    等待下次说话。结束判定基于最近 silence_timeout_frames 帧的滑动窗口：
+    只有窗口内存在连续 speech_confirm_frames 个 is_speech 帧才视为对话进行中，
+    偶然的孤立噪音帧不足 confirm_frames 帧连续，不会重置静音计时，避免对话
+    窗口被噪音无限延长、增加 ASR 延迟。
 
     行为（类似 test_tencent_asr.py 的 VAD 录音）:
-      🔇 静音等待 → 🎤 检测到人声 → 实时识别 → 🔇 静音超时 → 打印本轮结果
+      🔇 静音等待 → 🎤 检测到人声 → 实时识别 → 🔇 最近窗口无连续人声 → 打印本轮结果
     """
     import sounddevice as sd
 
-    vad = _init_vad(vad_mode)
+    vad = init_vad(vad_mode)
     devices = sd.query_devices()
     if len(devices) == 0:
         logger.error("未检测到麦克风")
@@ -381,8 +368,12 @@ def recognize_microphone_vad(recognizer, vad_mode: int = 3,
 
     silence_timeout_frames = silence_timeout_ms // VAD_FRAME_MS
     speech_confirm = 0
-    silence_counter = 0
     in_speech = False
+
+    # 最近 silence_timeout_frames 帧的 is_speech 标记滑动窗口（maxlen 自动丢弃
+    # 最旧帧）：窗口内存在连续 speech_confirm_frames 个 is_speech 帧才视为对话
+    # 进行中；孤立噪音帧不会重置静音计时，避免对话窗口被噪音无限延长
+    recent_flags: deque = deque(maxlen=max(silence_timeout_frames, speech_confirm_frames))
 
     stream = recognizer.create_stream()
     last_result = ""
@@ -399,11 +390,11 @@ def recognize_microphone_vad(recognizer, vad_mode: int = 3,
                 samples = samples.reshape(-1)
                 pcm_bytes = samples.tobytes()
 
-                is_speech = _is_speech_frame(vad, pcm_bytes)
+                is_speech = is_speech_frame(vad, pcm_bytes)
+                recent_flags.append(is_speech)
 
                 if is_speech:
                     speech_confirm += 1
-                    silence_counter = 0
 
                     if not in_speech and speech_confirm >= speech_confirm_frames:
                         # 语音开始 → 创建新 stream，开始识别
@@ -425,33 +416,36 @@ def recognize_microphone_vad(recognizer, vad_mode: int = 3,
                 else:
                     speech_confirm = 0
                     if in_speech:
-                        silence_counter += 1
                         # 静音期间继续送帧（保持 ASR 尾部处理）
                         audio_float = samples.astype(np.float32) / 32768.0
                         stream.accept_waveform(mic_sample_rate, audio_float)
                         while recognizer.is_ready(stream):
                             recognizer.decode_stream(stream)
 
-                        if silence_counter >= silence_timeout_frames:
-                            # 静音超时 → 结束本轮
-                            tail = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
-                            stream.accept_waveform(SAMPLE_RATE, tail)
-                            stream.input_finished()
-                            while True:
-                                if recognizer.is_ready(stream):
-                                    recognizer.decode_stream(stream)
-                                else:
-                                    break
-                            final = recognizer.get_result(stream)
-                            if final:
-                                round_results.append(final)
-                                print(f"\r  ✅ {final}")
-                            else:
-                                print("\r  🔇 无识别结果")
-                            in_speech = False
-                            silence_counter = 0
-                            speech_confirm = 0
-                            print("\n🔊 等待下轮说话...", end="", flush=True)
+                # 对话结束判定（录音中）：最近 silence_timeout_frames 帧内不存在
+                # 连续 speech_confirm_frames 个 is_speech 帧 → 对话已结束，立即
+                # 结束本轮并取最终结果。孤立噪音帧不构成确认语音，不会延长对话
+                # 窗口（旧机制中任一 is_speech 帧都会重置静音计数）
+                if in_speech and not has_confirmed_run(recent_flags, speech_confirm_frames):
+                    # 结束本轮
+                    tail = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
+                    stream.accept_waveform(SAMPLE_RATE, tail)
+                    stream.input_finished()
+                    while True:
+                        if recognizer.is_ready(stream):
+                            recognizer.decode_stream(stream)
+                        else:
+                            break
+                    final = recognizer.get_result(stream)
+                    if final:
+                        round_results.append(final)
+                        print(f"\r  ✅ {final}")
+                    else:
+                        print("\r  🔇 无识别结果")
+                    in_speech = False
+                    speech_confirm = 0
+                    recent_flags.clear()
+                    print("\n🔊 等待下轮说话...", end="", flush=True)
 
     except KeyboardInterrupt:
         # 打印本轮最终结果
@@ -565,9 +559,7 @@ def main():
 
     p.add_argument("--model-dir", type=str, default=MODEL_DIR,
                    help="模型目录")
-    p.add_argument("--chunk", type=int, default=16, choices=[8, 16],
-                   help="模型 chunk 大小")
-    p.add_argument("--num-threads", type=int, default=2,
+    p.add_argument("--num-threads", type=int, default=1,
                    help="推理线程数")
     p.add_argument("--callback", action="store_true",
                    help="使用回调风格 API（类似 test_tencent_asr.py）")
@@ -626,7 +618,7 @@ def main():
             logger.error("❌ 缺少依赖: %s\n   pip install sherpa-onnx sounddevice", e)
             sys.exit(1)
 
-        recognizer = create_recognizer(model_path, args.chunk, args.num_threads)
+        recognizer = create_recognizer(model_path, args.num_threads)
         if args.vad:
             recognize_microphone_vad(
                 recognizer,
