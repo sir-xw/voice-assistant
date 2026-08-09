@@ -67,6 +67,12 @@ class VoiceFrontendConfig:
 
     sample_rate: int = SAMPLE_RATE
     frame_duration_ms: int = FRAME_DURATION_MS
+    # 麦克风采集采样率：0=自动探测设备支持的采样率（默认优先 16kHz，其次
+    # 48000/44100 等）；非 0 则强制使用。采集后内部会重采样到 sample_rate
+    mic_sample_rate: int = 0
+    # 麦克风采集设备：None/空=自动（优先 pipewire/pulse，确保音频栈一致）；
+    # 也可指定设备索引或名称
+    mic_device: int | str | None = None
 
     # 连续对话
     conversation_window_sec: float = 8.0
@@ -185,6 +191,10 @@ class VoiceFrontend:
 
         # 音频流
         self._audio_stream = None
+        # 实际打开的麦克风采样率（可能 ≠ sample_rate，采集后重采样到 16kHz）
+        self._device_sr = SAMPLE_RATE
+        # 实际选用的采集设备（None=系统默认）
+        self._mic_device = None
         # 音频处理队列（回调 → 工作线程，避免阻塞音频回调导致 overflow）
         self._audio_queue: queue.Queue = queue.Queue(maxsize=64)
         self._audio_consumer: threading.Thread | None = None
@@ -369,8 +379,71 @@ class VoiceFrontend:
         return None
 
     # 麦克风
+    def _pick_input_device(self):
+        """选择麦克风采集设备。
+
+        默认优先 pipewire：ALSA 的 pulse 插件设备会把采集交给 pipewire-pulse，
+        采样率任意、与 TTS 输出共用同一音频栈；没有 pipewire 时才退回系统默认
+        输入设备（配合重采样兜底）。
+        """
+        if self.config.mic_device:
+            return self.config.mic_device
+        import sounddevice as sd
+        try:
+            for i, d in enumerate(sd.query_devices()):
+                if d["max_input_channels"] > 0:
+                    name = d["name"].lower()
+                    if "pipewire" in name or "pulse" in name:
+                        logger.info("使用 pipewire 输入设备: %s (idx=%d)",
+                                    d["name"], i)
+                        return i
+        except Exception:
+            pass
+        return None  # 系统默认输入设备
+
+    def _pick_input_sample_rate(self, device=None) -> int:
+        """探测指定输入设备支持的采样率：优先 16kHz，其次常见高采样率。
+
+        某些 USB 麦克风（如 AIMIC-M4）直连硬件只支持 48000Hz，用 16kHz 打开
+        会报 paInvalidSampleRate。返回后由采集线程重采样到 sample_rate。
+        """
+        if self.config.mic_sample_rate > 0:
+            return self.config.mic_sample_rate
+        import sounddevice as sd
+        for sr in (SAMPLE_RATE, 48000, 44100, 32000, 22050):
+            try:
+                sd.check_input_settings(device=device, samplerate=sr,
+                                        channels=CHANNELS, dtype="int16")
+                return sr
+            except Exception:
+                continue
+        # 全部失败则退回设备默认采样率（最后的兜底）
+        try:
+            return int(sd.query_devices(device, "input")["default_samplerate"])
+        except Exception:
+            return SAMPLE_RATE
+
+    def _resample_pcm16_to_16k(self, samples_int16: np.ndarray,
+                               src_sr: int) -> np.ndarray:
+        """把一段 int16 PCM 从 src_sr 重采样到 16kHz（供 VAD/KWS/ASR 使用）。"""
+        if src_sr == SAMPLE_RATE:
+            return samples_int16
+        from scipy import signal
+        n_target = round(len(samples_int16) * SAMPLE_RATE / src_sr)
+        out = signal.resample_poly(samples_int16.astype(np.float32),
+                                   SAMPLE_RATE, src_sr)
+        if len(out) > n_target:
+            out = out[:n_target]
+        elif len(out) < n_target:
+            out = np.pad(out, (0, n_target - len(out)))
+        return np.clip(out, -32768, 32767).astype(np.int16)
+
     def _start_mic(self):
         import sounddevice as sd
+
+        self._mic_device = self._pick_input_device()
+        self._device_sr = self._pick_input_sample_rate(self._mic_device)
+        mic_blocksize = int(self._device_sr * FRAME_DURATION_MS / 1000)
 
         def audio_callback(indata, frames, time_info, status):
             if not self._running:
@@ -391,15 +464,17 @@ class VoiceFrontend:
 
         try:
             self._audio_stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
+                device=self._mic_device,
+                samplerate=self._device_sr,
                 channels=CHANNELS,
                 dtype="int16",
-                blocksize=FRAME_SIZE,
+                blocksize=mic_blocksize,
                 latency="high",
                 callback=audio_callback,
             )
             self._audio_stream.start()
-            logger.info("Mic stream started")
+            logger.info(f"Mic stream started (device={self._mic_device}, "
+                        f"{self._device_sr} Hz, {mic_blocksize} samples/block)")
         except Exception as e:
             logger.error(f"Failed to start mic: {e}")
             self._set_state(VoiceState.ERROR)
@@ -412,6 +487,11 @@ class VoiceFrontend:
         while self._running:
             try:
                 pcm_bytes, audio_array = self._audio_queue.get(timeout=1.0)
+                if self._device_sr != SAMPLE_RATE:
+                    # 设备采样率 ≠ 16kHz：先重采样再交给状态机处理
+                    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+                    pcm_bytes = self._resample_pcm16_to_16k(
+                        samples, self._device_sr).tobytes()
                 self._process_audio_frame(pcm_bytes, audio_array)
             except queue.Empty:
                 continue

@@ -166,6 +166,9 @@ class VoiceApp:
             merged_prompt = (ac.get("system_prompt", "") + speak_prompt)
             agent = AIAgent(
                 model=ac.get("model", "openai/gpt-4o-mini"),
+                provider=ac.get("provider"),
+                api_mode=ac.get("api_mode"),
+                base_url=ac.get("base_url"),
                 quiet_mode=False,
                 skip_context_files=True,
                 skip_memory=True,
@@ -176,8 +179,9 @@ class VoiceApp:
             )
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
             self._agents[name] = (agent, executor, None, 0)  # (agent, executor, history, generation)
-            logger.info("Agent [%s]: model=%s, session=%s",
-                        name, ac.get("model"), ac.get("session_id"))
+            logger.info("Agent [%s]: model=%s, provider=%s, api_mode=%s, session=%s",
+                        name, ac.get("model"), agent.provider,
+                        agent.api_mode, ac.get("session_id"))
 
         logger.info("Total agents: %d", len(self._agents))
 
@@ -199,6 +203,9 @@ class VoiceApp:
             min_speech_ms=self.config["vad"]["min_speech_ms"],
             vad_silence_threshold_ms=self.config["vad"].get("silence_threshold_ms", 600),
             vad_speech_confirm_frames=self.config["vad"].get("speech_confirm_frames", 3),
+            mic_sample_rate=self.config.get("mic_sample_rate", 0),
+            mic_device=None if str(self.config.get("mic_device") or "").lower()
+            in ("", "auto") else self.config["mic_device"],
             conversation_window_sec=self.config.get("conversation_window", {}).get("timeout_sec", 8.0),
             on_interim=self._on_frontend_interim,
             on_final=self._on_frontend_final,

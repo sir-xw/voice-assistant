@@ -4,7 +4,7 @@ voice:
   wake_word:
     enabled: true
     engine: "sherpa-onnx"
-    threshold: 0.5
+    threshold: 0.25
     score: 1.0
     model:
       dir: "models/sherpa-kws"
@@ -21,8 +21,16 @@ voice:
     silence_threshold_ms: 1000
     speech_confirm_frames: 3
 
+  # 麦克风采集采样率：0=自动探测设备支持的采样率（默认），非 0 强制指定。
+  # 某些 USB 麦克风（如 AIMIC-M4）只支持 48000Hz，采集后内部会重采样到 16kHz
+  mic_sample_rate: 0
+
+  # 麦克风采集设备：auto=自动（默认，优先 pipewire/pulse，确保与音频栈一致），
+  # 也可指定设备索引或名称（如 "pulse" / "AIMIC-M4"）
+  mic_device: auto
+
   asr:
-    engine_model: "16k_zh"
+    engine_model: "16k_zh_en_speaker_2.0"
     needvad: true
     voice_format: 1
 
@@ -37,9 +45,13 @@ voice:
 
   # 多 AI Agent 实例，每个由不同唤醒词触发
   # keyword 匹配 keywords.txt 中 @ 后面的原文
+  # api_mode：API 模式（如 codex_responses / chat_completions）；base_url：API 端点
   agents:
-    - name: "赫尔墨斯"
+    - name: "小布"
       model: "deepseek-v4-flash"
+      provider: "deepseek"
+      api_mode: "codex_responses"
+      base_url: "https://api.deepseek.com"
       max_iterations: 30
       session_id: "hermes-voice-session"
       system_prompt: |
