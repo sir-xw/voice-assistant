@@ -20,10 +20,8 @@ import time
 import wave
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from tencentcloud_speech.common.credential import Credential
-from tencentcloud_speech.tts.flowing_speech_synthesizer import (
+from voice_agent.tencentcloud_speech.common.credential import Credential
+from voice_agent.tencentcloud_speech.tts.flowing_speech_synthesizer import (
     FlowingSpeechSynthesizer,
     FlowingSpeechSynthesisListener,
     FlowingSpeechSynthesizer_ACTION_SYNTHESIS,

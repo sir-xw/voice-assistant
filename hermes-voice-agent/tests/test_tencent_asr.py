@@ -6,6 +6,7 @@
 通过 threading.Event 阻塞等待 SDK 回调，无需固定 sleep。
 
 用法:
+    # 在 hermes-voice-agent/ 目录下运行（src 已通过 pip install -e . 安装，无需 sys.path）
     # VAD 录音（静音 1s 自动停止）
     python -u tests/test_tencent_asr.py --record
 
@@ -29,11 +30,9 @@ import time
 from collections import deque
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from asr_engine import TencentCloudASREngine, TencentASRConfig, ASRState
-from config import load_config
-from vad import has_confirmed_run, init_vad, is_speech_frame
+from voice_agent.asr_engine import TencentCloudASREngine, TencentASRConfig, ASRState
+from voice_agent.config import load_config
+from voice_agent.vad import has_confirmed_run, init_vad, is_speech_frame
 
 logging.basicConfig(
     level=logging.INFO,

@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
-print(sys.path)
-
-from config import load_config
+from voice_agent.config import load_config
 from run_agent import AIAgent
 
 from tools.registry import registry

@@ -8,6 +8,7 @@ sherpa-onnx 流式 ASR 识别测试。
 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.tar.bz2
 
 用法:
+    # 在 hermes-voice-agent/ 目录下运行（src 已通过 pip install -e . 安装，无需 sys.path）
     # 识别 WAV 文件
     python -u tests/test_sherpa_asr.py --file test.wav
 
@@ -37,8 +38,7 @@ from collections import deque
 from pathlib import Path
 from typing import List, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from vad import has_confirmed_run, init_vad, is_speech_frame
+from voice_agent.vad import has_confirmed_run, init_vad, is_speech_frame
 
 import numpy as np
 
@@ -156,16 +156,6 @@ def generate_test_tone(duration_sec: float = 3.0) -> np.ndarray:
     t = np.linspace(0, duration_sec - 0.5, tone_len)
     tone = (np.sin(2 * np.pi * 440 * t) * 0.8).astype(np.float32)
     return np.concatenate([silence, tone])
-
-
-# ---------------------------------------------------------------------------
-# VAD 工具（仅用于控制 ASR 生命周期，不过滤音频样本）
-# 与 src/voice_frontend.py 共用 src/vad.py：VAD 只决定何时启动/停止 ASR，
-# 识别期间所有帧全量送入，不做静音去除。
-# ---------------------------------------------------------------------------
-
-
-
 
 
 # ---------------------------------------------------------------------------

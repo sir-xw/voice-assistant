@@ -19,7 +19,7 @@ import os
 import socket
 
 from tools.registry import registry
-from music_control import set_expected_status
+from voice_agent.music_control import set_expected_status
 
 logger = logging.getLogger("mpd_tool")
 

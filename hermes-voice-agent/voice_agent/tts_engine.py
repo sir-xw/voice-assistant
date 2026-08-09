@@ -13,8 +13,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from tencentcloud_speech.common.credential import Credential
-from tencentcloud_speech.tts.flowing_speech_synthesizer import (
+from voice_agent.tencentcloud_speech.common.credential import Credential
+from voice_agent.tencentcloud_speech.tts.flowing_speech_synthesizer import (
     FlowingSpeechSynthesizer,
     FlowingSpeechSynthesisListener,
     FlowingSpeechSynthesizer_ACTION_SYNTHESIS,

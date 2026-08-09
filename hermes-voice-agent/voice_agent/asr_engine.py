@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from tencentcloud_speech.common.credential import Credential
-from tencentcloud_speech.asr.realtime_recognizer_v2 import RealtimeRecognitionListenerV2, RealtimeRecognizerV2
+from voice_agent.tencentcloud_speech.common.credential import Credential
+from voice_agent.tencentcloud_speech.asr.realtime_recognizer_v2 import RealtimeRecognitionListenerV2, RealtimeRecognizerV2
 
 
 logger = logging.getLogger(__name__)

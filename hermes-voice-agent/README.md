@@ -187,7 +187,7 @@ python -c "import sounddevice; print(sounddevice.query_devices())"
 ### 6. 运行
 
 ```bash
-python -u src/main.py
+python -u -m voice_agent
 ```
 
 说出唤醒词（默认 `赫尔墨斯`）开始对话。
@@ -281,7 +281,7 @@ Type=simple
 User=your_user
 WorkingDirectory=/path/to/hermes-voice-agent
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -u src/main.py
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -u -m voice_agent
 Restart=always
 RestartSec=5
 
@@ -340,7 +340,7 @@ sudo journalctl -u hermes-voice -f  # 查看日志
 ## 文件结构
 
 ```
-├── src/                      # 核心代码
+├── voice_agent/               # 核心代码包（pip install -e .）
 │   ├── main.py               # 入口：组装全链路、回调绑定
 │   ├── voice_frontend.py     # 麦克风采集 + 唤醒词 + VAD + 状态机
 │   ├── asr_engine.py         # 腾讯云 ASR 引擎（WebSocket）

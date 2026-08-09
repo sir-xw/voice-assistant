@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vad import has_confirmed_run, init_vad, is_speech_frame
+from voice_agent.vad import has_confirmed_run, init_vad, is_speech_frame
 
 logger = logging.getLogger(__name__)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hermes Agent 语音输入前端 — 入口点。
+Hermes Agent 语音输入前端 — VoiceApp 应用逻辑。
 
 整合：
   - Sherpa-onnx唤醒词 + WebRTC VAD
@@ -10,33 +10,29 @@ Hermes Agent 语音输入前端 — 入口点。
   - 唤醒词打断 TTS + 代理对话
   - AI 自主 speak 工具（阶段性汇报 + 最终回答）
 
-用法:
-    python -u src/main.py
+本模块只定义 VoiceApp，不包含启动入口。
+启动方式见 __main__.py（python -m voice_agent）或项目根启动脚本。
 """
 
 import asyncio
 import logging
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# 确保 src 和 hermes-agent 可导入
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from asr_engine import TencentCloudASREngine, TencentASRConfig
-from audio_player import AudioPlayer, AudioPlayerConfig
-from config import load_config
-from tts_engine import TencentCloudTTSEngine, TencentTTSConfig
-from music_control import player_pause, player_resume
-from voice_frontend import VoiceFrontend, VoiceFrontendConfig, VoiceState
+from .asr_engine import TencentCloudASREngine, TencentASRConfig
+from .audio_player import AudioPlayer, AudioPlayerConfig
+from .config import load_config
+from .tts_engine import TencentCloudTTSEngine, TencentTTSConfig
+from .music_control import player_pause, player_resume
+from .voice_frontend import VoiceFrontend, VoiceFrontendConfig, VoiceState
 
 # Hermes Agent（嵌入运行）
 from run_agent import AIAgent
 
 # AI 工具注册
 from tools.registry import registry
-from mpd_tool import register_all as register_mpd_tools
+from .mpd_tool import register_all as register_mpd_tools
 
 logger = logging.getLogger("main")
 
@@ -713,26 +709,3 @@ class VoiceApp:
         logger.error(f"ASR: {msg}")
         if self.frontend and self.frontend.config.on_error:
             self.frontend.config.on_error(msg)
-
-
-# ─── 入口 ────────────────────────────────────────────────
-
-async def main():
-    app = VoiceApp()
-    try:
-        await app.start()
-        while app._running:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("\nShutting down...")
-    finally:
-        await app.stop()
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    asyncio.run(main())
