@@ -16,6 +16,7 @@ Hermes Agent 语音输入前端 — VoiceApp 应用逻辑。
 
 import asyncio
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -66,9 +67,15 @@ class VoiceApp:
         self._speak_consumer_task: asyncio.Task | None = None
 
         # 待汇报队列：agent 完成但当前有其他 agent 活跃时排队
-        # 元素: (keyword, response_text, gen, emotion)
-        self._pending: list[tuple[str, str, int, str]] = []
+        # 元素: (keyword, segments, gen)；segments 为 [(emotion, text), ...]
+        self._pending: list[tuple[str, list, int]] = []
         self._user_title = self.config.get("user_title", "主人")
+
+        # 等待回复提示音：ASR 结束后、LLM 回复/TTS 开始前循环播放，
+        # 提示用户当前不再收听语音。_wait_tone_waiting 为等待计数（多 agent
+        # 并发时任一在等待即播放）
+        self._wait_tone_task: asyncio.Task | None = None
+        self._wait_tone_waiting = 0
 
     # ─── 生命周期 ────────────────────────────────────────
 
@@ -203,6 +210,7 @@ class VoiceApp:
             min_speech_ms=self.config["vad"]["min_speech_ms"],
             vad_silence_threshold_ms=self.config["vad"].get("silence_threshold_ms", 600),
             vad_speech_confirm_frames=self.config["vad"].get("speech_confirm_frames", 3),
+            wake_guard_sec=self.config["vad"].get("wake_guard_sec", 2.5),
             mic_sample_rate=self.config.get("mic_sample_rate", 0),
             mic_device=None if str(self.config.get("mic_device") or "").lower()
             in ("", "auto") else self.config["mic_device"],
@@ -329,6 +337,7 @@ class VoiceApp:
             return
 
         logger.info(f"🔊 Speak: {text[:60]}...")
+        self._stop_wait_tone()  # 播报前停止提示音
         player_pause(force=True)
         try:
             if self.frontend:
@@ -349,6 +358,9 @@ class VoiceApp:
             if self.frontend:
                 self.frontend.set_tts_playing(False)
             player_resume()
+            # 阶段性汇报播完：agent 可能仍在等待最终回复 → 恢复提示音
+            if self._wait_tone_waiting > 0:
+                self._start_wait_tone()
 
     # ─── 核心流程 ────────────────────────────────────────
 
@@ -410,23 +422,31 @@ class VoiceApp:
                         )
                     return
 
-                # 解析 (情绪)文字内容 格式
-                emotion, speak_text = self._parse_emotion_response(response)
-                logger.info(f"(gen={gen}) [{name}] Parsed: emotion={emotion}, text={speak_text[:60]}")
-                if not speak_text:
+                # 解析 (情绪)文字内容 格式（支持多个情绪标记分段）
+                segments = self._parse_emotion_segments(response)
+                logger.info(f"(gen={gen}) [{name}] Parsed: "
+                            f"{len(segments)} 段, 首段={segments[0][1][:30] if segments else ''}")
+                if not segments:
                     logger.info(f"✅ [{name}] Empty response after parse, skip")
                     return
 
                 if name == self._active_name:
                     asyncio.run_coroutine_threadsafe(
-                        self._speak_response(speak_text, emotion), self._loop
+                        self._speak_response(segments), self._loop
                     )
                 else:
-                    self._pending.append((name, speak_text, gen, emotion))
+                    self._pending.append((name, segments, gen))
                     logger.info(f"📥 [{name}] queued (pending={len(self._pending)})")
             except Exception as e:
                 logger.error(f"Agent [{name}] chat error: {e}")
+            finally:
+                # agent 处理结束（无论结果）：停止等待提示音。
+                # _stop_wait_tone 是同步函数，跨线程用 call_soon_threadsafe
+                # （run_coroutine_threadsafe 需要协程对象，传同步调用会抛 TypeError）
+                self._loop.call_soon_threadsafe(self._stop_wait_tone)
 
+        # 开始等待 LLM 回复：循环播放提示音（提示不再收听）
+        self._start_wait_tone()
         executor.submit(_chat)
 
     async def _speak(self, text: str):
@@ -435,6 +455,7 @@ class VoiceApp:
             return
 
         logger.info(f"🔊 TTS: {text[:60]}...")
+        self._stop_wait_tone()  # TTS 播放前停止提示音
         # TTS 播放前强制暂停音乐（即使 agent 执行期间用户恢复了播放）
         player_pause(force=True)
         try:
@@ -477,7 +498,7 @@ class VoiceApp:
         if self.frontend and self.frontend.state.value != "idle":
             return
 
-        kw, text, gen, emotion = self._pending.pop(0)
+        kw, segments, gen = self._pending.pop(0)
         # 检查该 agent 的代际是否仍匹配
         _, _, _, current_gen = self._agents.get(kw, (None, None, None, -1))
         if gen != current_gen:
@@ -485,69 +506,113 @@ class VoiceApp:
             self._deliver_pending()  # 尝试下一个
             return
 
-        greeting = f"{self._user_title}，我是{kw}，{text}"
-        logger.info("📤 Delivering pending result from [%s]: %s...", kw, text[:60])
+        # 问候前缀加到第一段，然后统一走 _speak_response（内部支持多段拼接播放）
+        first_emotion, first_text = segments[0]
+        greeting = f"{self._user_title}，我是{kw}，{first_text}"
+        segs = [(first_emotion, greeting)] + segments[1:]
+        logger.info("📤 Delivering pending result from [%s]: %s...",
+                    kw, greeting[:60])
         asyncio.run_coroutine_threadsafe(
-            self._speak_response(greeting, emotion), self._loop
+            self._speak_response(segs), self._loop
         )
 
     # ─── 情绪解析工具 ────────────────────────────────────
 
-    def _parse_emotion_response(self, response: str) -> tuple[str, str]:
+    # 合法情绪集合（与 speak 工具 schema、TTS 引擎保持一致）
+    VALID_EMOTIONS = {
+        "neutral", "sad", "happy", "angry", "fear",
+        "story", "poetry", "sajiao", "disgusted", "amaze",
+        "exciting", "aojiao", "jieshuo",
+    }
+    EMOTION_PATTERN = re.compile(
+        r"\((?:%s)\)" % "|".join(sorted(VALID_EMOTIONS)), re.IGNORECASE)
+
+    def _parse_emotion_segments(self, response: str) -> list[tuple[str, str]]:
         """
-        解析 AI 最终回复中的 (情绪)文字内容 格式。
+        解析 AI 最终回复中的 (情绪)文字内容 格式，支持多个情绪标记分段。
+
+        大模型可能在一段回复里用多个情绪标记分别表达不同语气，例如：
+            (neutral)好嘞，再来一个！……(happy)哈哈，好笑吗？
+        这里把每个 "(情绪)" 标记作为一段的起点，逐段切出
+        [(emotion, text), ...]；段首无标记的文本归入 emotion="" 段。
 
         Args:
             response: AI 的文字回复
 
         Returns:
-            (emotion, text) 元组。
-            emotion 为空表示未指定情绪。
-            如果格式不匹配，emotion="" 且 text=response。
+            [(emotion, text), ...] 非空段列表；emotion 为空表示该段未指定情绪。
+            整段无任何情绪标记时返回 [("", response)]。
         """
-        response = response.strip().replace('（', '(').replace('）',')')
-        if response.startswith("("):
-            close_idx = response.find(")")
-            if close_idx > 0:
-                emotion = response[1:close_idx].strip().lower()
-                text = response[close_idx+1:].strip()
-                # 验证情绪是否有效
-                valid_emotions = {
-                    "neutral", "sad", "happy", "angry", "fear",
-                    "story", "poetry", "sajiao", "disgusted", "amaze",
-                    "exciting", "aojiao", "jieshuo"
-                }
-                if emotion not in valid_emotions:
-                    emotion = ""  # 无效情绪视为未指定
-                return emotion, text
-        return "", response
+        response = response.strip().replace('（', '(').replace('）', ')')
+        if not response:
+            return []
+        matches = list(self.EMOTION_PATTERN.finditer(response))
+        if not matches:
+            return [("", response)]
 
-    async def _speak_response(self, text: str, emotion: str = ""):
+        segments: list[tuple[str, str]] = []
+        # 第一个标记之前的文本（无情绪前缀）
+        if matches[0].start() > 0:
+            head = response[:matches[0].start()].strip()
+            if head:
+                segments.append(("", head))
+        # 每个标记领起一段，到下一个标记前结束
+        for i, m in enumerate(matches):
+            emotion = m.group(0)[1:-1].strip().lower()
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
+            text = response[start:end].strip()
+            if text:
+                segments.append((emotion, text))
+        return segments
+
+    async def _speak_response(self, segments):
         """
-        播放 AI 最终回答（带通知音和对话窗口）。
+        播放 AI 最终回答（支持多段情绪，带通知音和对话窗口）。
 
         Args:
-            text: 要播报的文本
-            emotion: 情绪/风格
+            segments: [(emotion, text), ...] 段列表；emotion 为空表示不指定情绪。
+                      单段回复传 [("", text)] 或 [("neutral", text)] 即可。
+
+        播放策略：**全程流式实时**。腾讯云 TTS 边合成边推音频块，on_audio_chunk
+        直接接播放器，音频随到随播（低首字延迟）；多段时逐段按各自情绪合成，
+        前一段的音频在播放队列里自然续上后一段的内容（段间换情绪需重连 WS，
+        会有极短的衔接停顿）。全部内容播完后播通知音并进入对话窗口。
         """
-        if not text.strip() or not self.tts_engine:
+        import time as _t
+
+        if not segments or not self.tts_engine:
+            return
+        texts = [t for _, t in segments if t and t.strip()]
+        if not texts:
             return
 
-        logger.info(f"🔊 Response: {text[:60]}...")
+        logger.info(f"🔊 Response: {len(segments)} 段, 首段 {texts[0][:40]}...")
+        self._stop_wait_tone()  # TTS 播放前停止提示音
         player_pause(force=True)
         try:
             if self.frontend:
                 self.frontend.set_tts_playing(True)
-            self.tts_engine.start()
-            if emotion:
-                self.tts_engine.set_emotion(emotion)
-            self.tts_engine.synthesize(text)
-            self.tts_engine.complete()
-            self.tts_engine.wait(timeout=15)
+
+            # 全程流式实时：音频块直接喂播放器，逐段边合成边播
+            self.tts_engine.on_audio_chunk = (
+                self.audio_player.feed if self.audio_player else None)
+            for emotion, text in segments:
+                if not text or not text.strip():
+                    continue
+                self.tts_engine.start()
+                if emotion:
+                    self.tts_engine.set_emotion(emotion)
+                self.tts_engine.synthesize(text)
+                self.tts_engine.complete()
+                self.tts_engine.wait(timeout=15)
+
+            # 全部合成完，等待播放队列播完
             if self.audio_player:
                 self.audio_player.wait_for_drain(timeout=15.0)
-                import time as _t
                 _t.sleep(0.15)
+
+            # 全部播完后：通知音 + 进入对话窗口
             self._play_asset("notification")
             if self.audio_player:
                 self.audio_player.wait_for_drain(timeout=5.0)
@@ -557,6 +622,10 @@ class VoiceApp:
         except Exception as e:
             logger.warning(f"Response TTS error: {e}")
         finally:
+            # 恢复音频回调到播放器
+            if self.tts_engine:
+                self.tts_engine.on_audio_chunk = (
+                    self.audio_player.feed if self.audio_player else None)
             if self.frontend:
                 self.frontend.set_tts_playing(False)
             player_resume()
@@ -564,6 +633,7 @@ class VoiceApp:
 
     async def _close_conversation(self):
         """关闭对话窗口，回到 IDLE 状态（处理后恢复音乐）。"""
+        self._stop_wait_tone()  # 对话结束：停止等待提示音
         if self.frontend:
             self.frontend._cancel_conversation_timer()
             # 强制切换到 IDLE，触发 _on_frontend_state_change → player_resume + _deliver_pending
@@ -583,6 +653,8 @@ class VoiceApp:
     PROMPT_PATH = Path(__file__).resolve().parent.parent / "assets" / "prompt.wav"
     NOTIFICATION_PATH = Path(__file__).resolve().parent.parent / "assets" / "notification.wav"
     FAREWELL_PATH = Path(__file__).resolve().parent.parent / "assets" / "farewell.wav"
+    # 等待回复提示音（2s 低幅提示音，循环播放提示"不再收听"）
+    WAIT_TONE_PATH = Path(__file__).resolve().parent.parent / "assets" / "wait_cue_4_scale.wav"
 
     def _get_prompt_duration_sec(self) -> float:
         """读取提示音 wav 的实际时长（秒）。"""
@@ -611,6 +683,70 @@ class VoiceApp:
         except Exception as e:
             logger.warning(f"Play {name} error: {e}")
 
+    # ─── 等待回复提示音 ──────────────────────────────
+
+    def _start_wait_tone(self):
+        """
+        开始循环播放提示音（等待 LLM 回复期间，提示用户当前不再收听）。
+
+        幂等：计数 +1；计数从 0 变 1 时启动播放任务。
+        播放前暂停音乐，避免与背景音混播。
+
+        注意：本方法可能在非 asyncio 线程被调用（_ask_agent 由 ASR SDK
+        接收线程触发），因此用 call_soon_threadsafe 把任务创建调度到事件
+        循环线程，避免 ensure_future 因"无运行中的事件循环"抛异常。
+        """
+        self._wait_tone_waiting += 1
+        if self._wait_tone_task is None:
+            if not self.WAIT_TONE_PATH.is_file():
+                logger.warning("等待提示音文件缺失: %s", self.WAIT_TONE_PATH)
+                return
+            if self._loop is None:
+                logger.warning("事件循环未就绪，跳过等待提示音")
+                return
+            player_pause(force=True)
+            if self.audio_player:
+                self.audio_player.clear()
+            self._loop.call_soon_threadsafe(self._spawn_wait_tone_task)
+
+    def _spawn_wait_tone_task(self):
+        """在事件循环线程内创建提示音播放任务（供 call_soon_threadsafe 调用）。"""
+        if self._wait_tone_task is None:
+            self._wait_tone_task = asyncio.ensure_future(self._wait_tone_loop())
+
+    def _stop_wait_tone(self):
+        """
+        停止提示音（TTS 开始 / 对话结束 / 打断时调用）。
+
+        幂等：计数 -1；计数归 0 时取消播放任务并清空队列中未播的提示音。
+        """
+        if self._wait_tone_waiting > 0:
+            self._wait_tone_waiting -= 1
+        if self._wait_tone_waiting == 0 and self._wait_tone_task is not None:
+            self._wait_tone_task.cancel()
+            self._wait_tone_task = None
+            if self.audio_player:
+                self.audio_player.clear()
+
+    async def _wait_tone_loop(self):
+        """循环把提示音 PCM 喂给播放器（按播放时长节流）。"""
+        try:
+            import wave
+
+            with wave.open(str(self.WAIT_TONE_PATH), "rb") as wf:
+                data = wf.readframes(wf.getnframes())
+            if not data:
+                return
+            # 每段 2s，feed 后按播放时长 sleep，实现无缝循环
+            while True:
+                if self.audio_player:
+                    self.audio_player.feed(data)
+                await asyncio.sleep(len(data) / 32000.0)  # 16k 16bit = 32KB/s
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("提示音播放异常: %s", e)
+
     def _on_play_prompt(self):
         """播唤醒提示音。"""
         self._play_asset("prompt")
@@ -623,6 +759,9 @@ class VoiceApp:
         """
         old_active = self._active_name
         self._active_name = name
+
+        # 唤醒即打断：停止等待提示音（用户要开始说话/新对话）
+        self._stop_wait_tone()
 
         # 递增该 agent 的代际（旧结果自动失效）
         entry = self._agents.get(name)
@@ -669,6 +808,8 @@ class VoiceApp:
         logger.debug(f"Frontend: {state.value}")
         # 连续对话窗口过期 → IDLE → 递送待汇报结果
         if state.value == "idle":
+            # 兜底：对话结束（agent 出错/无回复等未走 TTS 路径时）停止等待提示音
+            self._stop_wait_tone()
             # 对话完全结束（无 ASR、TTS、连续对话窗口），恢复音乐播放
             player_resume()
             self._deliver_pending()
