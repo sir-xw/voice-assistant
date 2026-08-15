@@ -1,0 +1,9 @@
+[Unit]
+Description=USB 音箱音频链路健康检测与自动修复（QEMU usb-host 透传）
+After=pipewire.service pipewire-pulse.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python3 /root/git/voice-assistant/hermes-voice-agent/tools/usb_audio_health.py --auto
+StandardOutput=journal
+StandardError=journal

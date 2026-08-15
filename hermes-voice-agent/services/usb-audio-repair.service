@@ -1,0 +1,9 @@
+[Unit]
+Description=每日重建虚拟 USB 控制器（预防 USB 音箱杂音积累）
+After=pipewire.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /root/git/voice-assistant/hermes-voice-agent/tools/repair_usb_audio.sh
+StandardOutput=journal
+StandardError=journal
