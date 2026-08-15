@@ -27,6 +27,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "mode": 3,
             "silence_threshold_ms": 600,
             "min_speech_ms": 200,
+            "wake_guard_sec": 2.5,
         },
         "asr": {
             "engine_model": "16k_zh",
@@ -34,6 +35,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "voice_format": 1,
             "send_interval_ms": 200,
             "max_reconnect": 3,
+        },
+        "voiceprint": {
+            "enabled": False,
+            "threshold": 0.6,
+            "lib_dir": "models/voiceprint_lib",
+            "auto_register": True,
+            "min_register_sec": 1.5,
+            "speaker_id_cache": True,
+            "speaker_names": {},
         },
         "tts": {
             "enabled": True,

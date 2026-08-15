@@ -8,6 +8,7 @@
 import logging
 import sys
 import threading
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -18,6 +19,12 @@ from voice_agent.tencentcloud_speech.asr.realtime_recognizer_v2 import RealtimeR
 
 
 logger = logging.getLogger(__name__)
+
+# 会话音频缓冲上限（秒）：句子时间戳基于 feed 起点，缓冲需覆盖"句子可能跨越
+# 的最长时段"。实时场景中一轮对话一般 < 30s，保留最近 30s 足够且内存仅 ~1MB
+SESSION_AUDIO_MAX_SEC = 30.0
+SAMPLE_RATE = 16000
+SAMPLE_BYTES = 2  # int16
 
 
 class ASRState(Enum):
@@ -84,25 +91,58 @@ class _SDKListener(RealtimeRecognitionListenerV2):
                 if text:
                     interim_parts.append(text)
             else:
-                print(s)
-                # 最终稳态结果（sentence_type=1）
-                if text:
-                    self.engine._last_final_text = text
-                    if self.engine.on_final:
-                        try:
-                            self.engine.on_final(text)
-                        except Exception:
-                            pass
+                # 最终稳态结果（sentence_type=1），保留完整句子信息
+                self._collect_final_sentences([s])
         if interim_parts and self.engine.on_interim:
             try:
                 self.engine.on_interim("".join(interim_parts))
             except Exception:
                 pass
 
+    def _collect_final_sentences(self, sentences):
+        """
+        收集最终稳态句子（sentence_type=1）的完整信息并回调。
+
+        腾讯云实时识别（开启说话人分离后）每条最终句子自带：
+          - speaker_id: 说话人编号（0, 1, 2, ...）
+          - start_time / end_time: 句子在音频中的起止毫秒
+        这些信息供上层做"按句子段落截取音频 → 声纹识别说话人身份"。
+
+        收集到 engine._sentences（按到达顺序），同时向后兼容：
+          - engine._last_final_text / on_final 保持原有行为
+          - 新增可选回调 engine.on_sentence(info)
+        """
+        for s in sentences:
+            if s.get("sentence_type") != 1:
+                continue
+            text = s.get("sentence", "")
+            info = {
+                "text": text,
+                "speaker_id": s.get("speaker_id", 0),
+                "start_ms": int(s.get("start_time", 0) or 0),
+                "end_ms": int(s.get("end_time", 0) or 0),
+                "sentence_id": s.get("sentence_id", 0),
+            }
+            logger.debug("final sentence: %s", info)
+            if text:
+                self.engine._last_final_text = text
+            self.engine._sentences.append(info)
+            if self.engine.on_sentence:
+                try:
+                    self.engine.on_sentence(info)
+                except Exception:
+                    pass
+            if text and self.engine.on_final:
+                try:
+                    self.engine.on_final(text)
+                except Exception:
+                    pass
+
     def on_sentence_end(self, response):
         logger.info("ASR recognition complete")
-        # final==1：整个识别结束。从最终句子兜底补发文本
+        # final==1：整个识别结束。从最终句子兜底补发文本/句子信息
         sentences = response.get("sentences", {}).get("sentence_list", [])
+        self._collect_final_sentences(sentences)
         final_parts = [s.get("sentence", "") for s in sentences
                        if s.get("sentence_type") == 1]
         if final_parts:
@@ -170,6 +210,13 @@ class TencentCloudASREngine:
         self._lock = threading.Lock()
         self._complete_event = threading.Event()
         self._last_final_text: str = ""
+        # 本次识别的最终句子列表（含 speaker_id / 起止毫秒），按到达顺序
+        self._sentences: list[dict] = []
+
+        # 会话音频缓冲：feed_audio 送入的 16k PCM 累积（供按句子时间戳截取音频
+        # 做本地声纹识别）。deque 存块，保留最近 SESSION_AUDIO_MAX_SEC 秒
+        self._session_audio: deque[bytes] = deque()
+        self._session_audio_sec: float = 0.0
 
         # 连接期缓冲：WS 建立前的音频先存着，连上后补发
         self._pending_buffer: list[bytes] = []
@@ -179,6 +226,7 @@ class TencentCloudASREngine:
         self.on_start: Callable[[], None] | None = None
         self.on_interim: Callable[[str], None] | None = None
         self.on_final: Callable[[str], None] | None = None
+        self.on_sentence: Callable[[dict], None] | None = None
         self.on_complete: Callable[[], None] | None = None
         self.on_error: Callable[[str], None] | None = None
         self.on_state_change: Callable[[ASRState], None] | None = None
@@ -193,6 +241,9 @@ class TencentCloudASREngine:
         """
         self._complete_event.clear()
         self._last_final_text = ""
+        self._sentences.clear()
+        self._session_audio.clear()
+        self._session_audio_sec = 0.0
         self._pending_buffer.clear()
         self._set_state(ASRState.CONNECTING)
 
@@ -241,6 +292,10 @@ class TencentCloudASREngine:
         if self._recognizer is None:
             return
 
+        # 会话音频缓冲：无条件累积（与 ASR 收到的音频流顺序一致——连接期
+        # pending 也是按 feed 顺序缓冲、连接后按序补发，故时间戳天然对齐）
+        self._append_session_audio(pcm_chunk)
+
         # 检查 SDK 内部 WebSocket 实际状态（0=NOTOPEN, 1=STARTED,
         # 2=OPENED, 3=FINAL, 4=ERROR, 5=CLOSED）
         sdk_status = getattr(self._recognizer, "_status", 0)
@@ -276,6 +331,46 @@ class TencentCloudASREngine:
         except Exception as e:
             logger.warning(f"stop_recognition error: {e}")
 
+    # ─── 会话音频缓冲（供本地声纹识别按句子时间戳截取音频）──────
+
+    def _append_session_audio(self, pcm: bytes):
+        """累积会话音频，超出 SESSION_AUDIO_MAX_SEC 时丢弃最旧数据。"""
+        if not pcm:
+            return
+        self._session_audio.append(pcm)
+        self._session_audio_sec += len(pcm) / (SAMPLE_RATE * SAMPLE_BYTES)
+        while (self._session_audio_sec > SESSION_AUDIO_MAX_SEC
+               and len(self._session_audio) > 1):
+            dropped = self._session_audio.popleft()
+            self._session_audio_sec -= len(dropped) / (SAMPLE_RATE * SAMPLE_BYTES)
+
+    def get_sentence_audio(self, sentence: dict):
+        """
+        按句子的起止毫秒（相对本次 feed 音频流起点）从会话缓冲截取音频，
+        返回 16k float32 样本（[-1, 1]）；缓冲不足或区间非法时返回 None。
+
+        供上层在 on_sentence 回调中取该句音频做本地声纹识别。
+        """
+        import numpy as np
+
+        if not self._session_audio:
+            return None
+        start_byte = int(sentence.get("start_ms", 0) / 1000.0
+                         * SAMPLE_RATE * SAMPLE_BYTES)
+        end_byte = int(sentence.get("end_ms", 0) / 1000.0
+                       * SAMPLE_RATE * SAMPLE_BYTES)
+        if start_byte < 0 or end_byte <= start_byte:
+            return None
+        buf = b"".join(self._session_audio)
+        if start_byte >= len(buf):
+            return None
+        end_byte = min(end_byte, len(buf))
+        chunk = buf[start_byte:end_byte]
+        # 不足 50ms 的片段无识别意义
+        if len(chunk) < int(0.05 * SAMPLE_RATE) * SAMPLE_BYTES:
+            return None
+        return np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768
+
     # ─── 属性 ────────────────────────────────────────────
 
     @property
@@ -293,6 +388,15 @@ class TencentCloudASREngine:
     def last_text(self) -> str:
         """本次识别最终文本。"""
         return self._last_final_text
+
+    @property
+    def sentences(self) -> list[dict]:
+        """
+        本次识别的最终句子列表（按到达顺序），每项含:
+          text / speaker_id / start_ms / end_ms / sentence_id
+        开启说话人分离（enable_speaker_context=1）后 speaker_id 才有意义。
+        """
+        return list(self._sentences)
 
     def wait_for_complete(self, timeout: float = 10.0) -> bool:
         """

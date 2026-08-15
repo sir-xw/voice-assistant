@@ -71,6 +71,17 @@ class VoiceApp:
         self._pending: list[tuple[str, list, int]] = []
         self._user_title = self.config.get("user_title", "主人")
 
+        # 说话人识别（voiceprint 启用时非 None）：
+        # _vp_round 收集本轮对话每个句子的 (显示名, 文本)，on_final 时拼成
+        # "[说话人] 内容" 消息发给 LLM；_vp_id_cache 缓存腾讯云 speaker_id →
+        # (库id, 相似度)，同 speaker_id 只做一次声纹识别（低延迟）
+        self.voiceprint = None
+        self._vp_round: list[tuple[str, str]] = []
+        self._vp_id_cache: dict[int, tuple[str, float]] = {}
+        self._vp_auto_register = True
+        self._vp_min_register_sec = 1.5
+        self._vp_use_cache = True
+
         # 等待回复提示音：ASR 结束后、LLM 回复/TTS 开始前循环播放，
         # 提示用户当前不再收听语音。_wait_tone_waiting 为等待计数（多 agent
         # 并发时任一在等待即播放）
@@ -88,6 +99,28 @@ class VoiceApp:
 
         tencent_cfg = self._full_cfg.get("tencent", {})
 
+        # 说话人识别（可选，并行旁路）：每完成一个腾讯云句子，本地 CAM++
+        # 提取声纹与特征库对照，标注说话人；启用时 ASR 需开启说话人分离
+        vp_cfg = self.config.get("voiceprint", {})
+        if vp_cfg.get("enabled", False):
+            from .voiceprint import VoiceprintManager
+            lib_dir = Path(vp_cfg.get("lib_dir", "models/voiceprint_lib"))
+            if not lib_dir.is_absolute():
+                lib_dir = Path(__file__).resolve().parent.parent / lib_dir
+            self.voiceprint = VoiceprintManager(
+                lib_dir=lib_dir,
+                threshold=vp_cfg.get("threshold", 0.6),
+                speaker_names=vp_cfg.get("speaker_names", {}),
+            )
+            self._vp_auto_register = vp_cfg.get("auto_register", True)
+            self._vp_min_register_sec = vp_cfg.get("min_register_sec", 1.5)
+            self._vp_use_cache = vp_cfg.get("speaker_id_cache", True)
+            if self.voiceprint.extractor is None:
+                logger.warning("CAM++ 声纹模型不可用，说话人识别降级（不标注说话人）")
+                self.voiceprint = None
+        else:
+            logger.info("说话人识别未启用（voice.voiceprint.enabled=false）")
+
         # 1. ASR 引擎
         asr_config = TencentASRConfig(
             secret_id=tencent_cfg.get("secret_id", ""),
@@ -96,6 +129,8 @@ class VoiceApp:
             engine_model=self.config["asr"]["engine_model"],
             needvad=self.config["asr"]["needvad"],
             voice_format=self.config["asr"]["voice_format"],
+            # 开启说话人分离：句子带 speaker_id + 起止毫秒（需 speaker 引擎）
+            enable_speaker_context=1 if self.voiceprint else 0,
         )
         self.asr_engine = TencentCloudASREngine(asr_config)
         self.asr_engine.on_start = self._on_asr_start
@@ -105,6 +140,9 @@ class VoiceApp:
         self.asr_engine.on_final = None
         self.asr_engine.on_complete = self._on_asr_complete
         self.asr_engine.on_error = self._on_asr_error
+        if self.voiceprint:
+            # 每完成一个句子 → 本地声纹识别说话人（并行旁路）
+            self.asr_engine.on_sentence = self._on_asr_sentence
 
         # 2. TTS 引擎
         tts_cfg = self.config.get("tts", {})
@@ -145,6 +183,13 @@ class VoiceApp:
             '   直接说「今天晴天，25度，适合出门。」\n'
             '   如果确实听清了，不需要额外确认。\n'
             '4. 如果实在听不懂，直接说「不好意思没听清，能再说一遍吗？」\n'
+            '\n'
+            '【说话人标识说明】\n'
+            '发送给你的每条用户消息会以 [说话人身份] 前缀标注这句话是谁说的，\n'
+            '例如「[爸爸] 今天天气怎么样？」；多人连续说话时每句单独标注，如\n'
+            '「[爸爸] 今天天气怎么样？\n[妈妈] 顺便查下明天的」。说话人身份用于\n'
+            '帮助你理解对话上下文（例如区分不同家庭成员提出的问题），回答时\n'
+            '不需要复述说话人。\n'
             '\n'
             '【语音播报规则】\n'
             '你拥有 speak 工具，可以通过语音播报与用户实时交流。\n'
@@ -824,8 +869,14 @@ class VoiceApp:
         if name is None:
             logger.warning("No active agent for ASR result")
             return
-        logger.info(f"📝 [{name}] User said: {text}")
-        self._ask_agent(text, name)
+        # 说话人识别启用时：把本轮每句 "[说话人] 内容" 拼成消息发给 LLM
+        if self.voiceprint is not None and self._vp_round:
+            msg = "\n".join(f"[{spk}] {t}" for spk, t in self._vp_round)
+            self._vp_round.clear()
+        else:
+            msg = text
+        logger.info(f"📝 [{name}] User said: {msg}")
+        self._ask_agent(msg, name)
 
     def _on_frontend_error(self, msg: str):
         logger.error(f"❌ Frontend: {msg}")
@@ -834,9 +885,69 @@ class VoiceApp:
 
     def _on_asr_start(self):
         logger.debug("ASR started")
+        # 新一轮 ASR 会话：重置说话人识别上下文（本轮句子列表 + speaker_id 缓存）
+        self._vp_round.clear()
+        self._vp_id_cache.clear()
+
+    def _on_asr_sentence(self, info: dict):
+        """
+        腾讯云每完成一个句子 → 本地声纹识别说话人（并行旁路，不影响 agent 流程）。
+
+        识别结果收集到 _vp_round，on_final 时拼成 "[说话人] 内容" 消息发给 LLM；
+        新说话人按配置自动分配 id 注册；同 speaker_id 缓存避免重复声纹计算。
+        """
+        if self.voiceprint is None:
+            return
+        text = info.get("text", "").strip()
+        if not text:
+            return
+        tx_spk = info.get("speaker_id", 0)
+        try:
+            # 1) speaker_id 缓存：同一会话同一人只做一次声纹识别
+            if self._vp_use_cache and tx_spk in self._vp_id_cache:
+                spk_id, score = self._vp_id_cache[tx_spk]
+                name = self.voiceprint.display_name(spk_id)
+                logger.info("🗣️ [%s] %s（相似度 %.2f，缓存）", name, text, score)
+                self._vp_round.append((name, text))
+                return
+
+            # 2) 按腾讯云句子时段截取音频 → 声纹识别
+            samples = self.asr_engine.get_sentence_audio(info)
+            if samples is None or len(samples) == 0:
+                logger.warning("🗣️ 无法获取句子音频（缓冲不足）: %s", text[:20])
+                return
+            spk_id, score = self.voiceprint.identify(samples)
+
+            if spk_id is None:
+                # 新说话人：满足最短时长门槛才自动注册，避免劣质声纹入库
+                if (self._vp_auto_register
+                        and len(samples) / 16000 >= self._vp_min_register_sec):
+                    new_id = self.voiceprint.register(samples)
+                    if new_id:
+                        spk_id, score = new_id, 1.0
+                        name = self.voiceprint.display_name(spk_id)
+                        logger.info("🗣️ [新说话人] %s → 已注册为 %s", text, name)
+                    else:
+                        name = "未知"
+                        logger.info("🗣️ [未知] %s（注册失败，相似度 %.2f）", text, score)
+                else:
+                    name = "未知"
+                    logger.info("🗣️ [未知] %s（相似度 %.2f）", text, score)
+            else:
+                name = self.voiceprint.display_name(spk_id)
+                logger.info("🗣️ [%s] %s（相似度 %.2f）", name, text, score)
+
+            self._vp_round.append((name, text))
+            # 3) 缓存本次识别的 speaker_id（后续该人句子零声纹延迟）
+            if self._vp_use_cache and spk_id:
+                self._vp_id_cache[tx_spk] = (spk_id, score)
+        except Exception as e:
+            logger.warning("说话人识别异常: %s", e)
 
     def _on_asr_complete(self):
         logger.debug("ASR complete")
+        # 会话结束：说话人 speaker_id 缓存失效
+        self._vp_id_cache.clear()
         # 兜底：如果 on_final 未被 SDK 回调，从 last_text 补发
         if self.asr_engine and self.asr_engine.last_text.strip():
             if self.frontend and self.frontend.config.on_final:

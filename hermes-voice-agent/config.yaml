@@ -76,3 +76,22 @@ voice:
 
   conversation_window:
     timeout_sec: 5.0
+
+  # 说话人识别（可选）：
+  # 每完成一个腾讯云句子，本地 CAM++ 提取声纹与特征库对照，识别说话人并写入日志；
+  # 发送给 LLM 的消息会带上 [说话人身份] 前缀（格式说明已写入预设 system prompt）。
+  # 新说话人自动分配 spk_100 起的默认 id 并注册入库；管理员可在 speaker_names
+  # 中把默认 id 映射为真实身份（如 "spk_100": "爸爸"），重启后日志与消息显示真实名字。
+  # 注意：说话人分离引擎（16k_zh_en_speaker_2.0）与腾讯云情绪识别互斥，故无情绪字段。
+  voiceprint:
+    enabled: true
+    threshold: 0.6            # 声纹匹配阈值，低于此值视为新说话人
+    lib_dir: "models/voiceprint_lib"
+    auto_register: true       # 识别到新说话人自动分配 id 并注册
+    min_register_sec: 1.5     # 注册用最短句子时长（过短不入库，避免劣质声纹）
+    speaker_id_cache: true    # 同一会话同一 speaker_id 只识别一次（低延迟）
+    # 管理员身份映射：把自动分配的默认 id 关联为真实身份，重启后生效
+    # 例: {"spk_100": "爸爸", "spk_101": "妈妈", "spk_102": "孩子"}
+    speaker_names:
+      spk_100: 爸爸
+      spk_101: 淘淘

@@ -2,3 +2,9 @@ models
 .egg-info/
 __pycache__/
 *.egg-info/
+
+# 说话人声纹特征库（由 tests/test_speaker_identify.py --build-lib 生成）
+tests/voiceprint_lib/
+# 声纹特征库（运行时自动注册生成，可随时重建）
+tests/voiceprint_sim_lib/
+models/voiceprint_lib/
