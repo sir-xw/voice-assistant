@@ -90,8 +90,7 @@ voice:
     auto_register: true       # 识别到新说话人自动分配 id 并注册
     min_register_sec: 1.5     # 注册用最短句子时长（过短不入库，避免劣质声纹）
     speaker_id_cache: true    # 同一会话同一 speaker_id 只识别一次（低延迟）
-    # 管理员身份映射：把自动分配的默认 id 关联为真实身份，重启后生效
-    # 例: {"spk_100": "爸爸", "spk_101": "妈妈", "spk_102": "孩子"}
-    speaker_names:
-      spk_100: 爸爸
-      spk_101: 淘淘
+    # 管理员身份映射示例（部署时按需填写真实身份，重启后生效）：
+    # speaker_names:
+    #   spk_100: "爸爸"
+    #   spk_101: "妈妈"
