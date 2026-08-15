@@ -64,6 +64,11 @@ class VoiceFrontendConfig:
     vad_silence_threshold_ms: int = 600
     # VAD 语音开始确认帧数：连续多少帧检测到语音才认为真正开始
     vad_speech_confirm_frames: int = 3
+    # 唤醒词命中后的静音保护期（秒）：该时段内不应用静音超时。
+    # 唤醒瞬间提示音回声/唤醒词尾音可能让 VAD 短暂激活，随即静音超时
+    # 导致 ASR 过早结束（final 为空）。保护期内静音只送帧不结束，
+    # 等用户真正开口；保护期过后恢复正常的静音超时判定。
+    wake_guard_sec: float = 2.5
 
     sample_rate: int = SAMPLE_RATE
     frame_duration_ms: int = FRAME_DURATION_MS
@@ -188,6 +193,8 @@ class VoiceFrontend:
         self._recent_vad_flags: collections.deque = collections.deque(
             maxlen=max(self._silence_threshold_frames, self._speech_confirm_threshold)
         )
+        # 唤醒词命中后的静音保护截止时间（time.time() 之前不应用静音超时）
+        self._wake_guard_until: float = 0.0
 
         # 音频流
         self._audio_stream = None
@@ -563,8 +570,12 @@ class VoiceFrontend:
                 # 语音中遇到静音：继续送帧（保持 ASR 尾部处理）
                 self._feed_to_asr(pcm_bytes)
                 # 结束判定：窗口内不再存在连续确认语音帧 → 语音已结束。
-                # 孤立噪音帧不足确认帧连续，不会阻止结束
-                if not has_confirmed_run(self._recent_vad_flags, self._speech_confirm_threshold):
+                # 孤立噪音帧不足确认帧连续，不会阻止结束。
+                # 唤醒后的静音保护期内不结束（提示音回声/唤醒词尾音导致的
+                # 假激活不应立刻结束 ASR，等用户真正开口）
+                guard_active = time.time() < self._wake_guard_until
+                if not guard_active and not has_confirmed_run(
+                        self._recent_vad_flags, self._speech_confirm_threshold):
                     logger.info("VAD: silence threshold expired, speech ended")
                     self._was_speech = False
                     self._speech_confirm_counter = 0
@@ -593,6 +604,9 @@ class VoiceFrontend:
         self._was_speech = False
         self._recent_vad_flags.clear()
         self._speech_confirm_counter = 0
+        # 唤醒后进入静音保护期：提示音回声/唤醒词尾音可能让 VAD 短暂激活，
+        # 保护期内不应用静音超时，避免 ASR 在用户真正开口前就结束
+        self._wake_guard_until = time.time() + self.config.wake_guard_sec
 
         self.interrupt()
 

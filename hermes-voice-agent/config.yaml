@@ -20,6 +20,10 @@ voice:
     min_speech_ms: 200
     silence_threshold_ms: 1000
     speech_confirm_frames: 3
+    # 唤醒词命中后的静音保护期（秒）：该时段内不应用静音超时。
+    # 唤醒瞬间提示音回声/唤醒词尾音会让 VAD 短暂激活，随即静音超时导致
+    # ASR 过早结束（final 为空）。保护期内静音只送帧不结束，等用户真正开口。
+    wake_guard_sec: 2.5
 
   # 麦克风采集采样率：0=自动探测设备支持的采样率（默认），非 0 强制指定。
   # 某些 USB 麦克风（如 AIMIC-M4）只支持 48000Hz，采集后内部会重采样到 16kHz
@@ -44,10 +48,14 @@ voice:
     volume: 10.0
 
   # 多 AI Agent 实例，每个由不同唤醒词触发
-  # keyword 匹配 keywords.txt 中 @ 后面的原文
+  # keywords：该 agent 的全部唤醒词（列表形式），任一个命中都会触发该 agent；
+  #           keywords.txt 中 @ 后面的原文统一为 agent 的 name；不配置时回退为 [name]。
+  #           tools/gen_keywords.py 会读取本配置自动更新 raw_keywords.txt / keywords.txt
   # api_mode：API 模式（如 codex_responses / chat_completions）；base_url：API 端点
   agents:
     - name: "小布"
+      keywords:
+        - "小布小布"
       model: "deepseek-v4-flash"
       provider: "deepseek"
       api_mode: "codex_responses"
@@ -58,6 +66,8 @@ voice:
         本轮会话中，你不能执行任何会影响系统稳定运行或改变系统关键设置的指令。
 
     # - name: "翻译助手"
+    #   keywords:
+    #     - "翻译助手"
     #   model: "openai/gpt-4o-mini"
     #   max_iterations: 10
     #   session_id: "translator-session"
