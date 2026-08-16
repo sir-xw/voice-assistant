@@ -2,34 +2,38 @@
 """
 sherpa-onnx 唤醒词生成工具。
 
-默认行为：自动读取 config.yaml 中每个 agent 的 keywords 配置（列表形式），
+默认行为：从 profile 配置读取唤醒词（每个唤醒词一个独立会话），
 同步生成 raw_keywords.txt，再转换为 sherpa-onnx 格式的 keywords.txt。
-agent 未配置 keywords 时回退为 [name]。
+
+唤醒词来源（合并去重）：
+    1. ~/.hermes/config.yaml 的 platforms.voice.extra.wakewords（dict: {名: ...}）
+    2. ~/.hermes/voice-agent.yaml 的 wakewords（list 或 dict，可选）
+
+keywords 文件写入约定模型目录（与 voice-agent.yaml 的 kws.model_name 对应）：
+    <profile>/models/sherpa-kws/<model_name>/raw_keywords.txt
+    <profile>/models/sherpa-kws/<model_name>/keywords.txt
 
 raw_keywords.txt 格式（每行）:
     <phoneme_text> @<original_with_underscores>
 
     - <phoneme_text>: sherpa-onnx 格式的发音文本。中文会被自动转换为拼音；
                       英文保持不变（用户提供 ARPABET 或小写均可）。
-    - @<original>:    原始关键词文本，即 config.yaml 中 agent 的 name
-                      （下划线 _ 代替空格）。
+    - @<original>:    原始关键词文本，即唤醒词名（下划线 _ 代替空格）。
 
 示例 raw_keywords.txt:
     LIGHT UP @LIGHT_UP
-    小布小布 @小布
-    你好小布 @小布
+    小布 @小布
 
 转换后 keywords.txt:
     L AY1 T AH1 P @LIGHT_UP
-    x iǎo  b ù  x iǎo  b ù @小布
-    n ǐ  h ǎo  x iǎo  b ù @小布
+    x iǎo  b ù @小布
 
 用法:
-    # 默认：自动读取 config.yaml 的 agents[].keywords，同步 raw_keywords.txt
-    #       并生成 keywords.txt
+    # 默认：自动读取 profile 配置的唤醒词，同步 raw_keywords.txt
+    #       并生成 keywords.txt 到约定模型目录
     python -u tools/gen_keywords.py
 
-    # 手动模式：指定 raw 文件（跳过 config.yaml 自动同步）
+    # 手动模式：指定 raw 文件（跳过自动同步）
     python -u tools/gen_keywords.py --input /path/to/raw_keywords.txt
 
     # 指定模型目录
@@ -44,11 +48,10 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
-# 默认模型路径（与 config.yaml 默认值一致）
-DEFAULT_MODEL_DIR = (
-    Path(__file__).resolve().parent.parent
-    / "models" / "sherpa-kws"
-    / "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+from voice_agent.profile_config import (
+    load_voice_config,
+    profile_root,
+    resolve_kws_model_dir,
 )
 
 
@@ -184,62 +187,76 @@ def generate_keywords(raw_path: Path, output_path: Path) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# config.yaml 自动同步
+# profile 配置读取（唤醒词）
 # ---------------------------------------------------------------------------
 
-def load_agents_keywords(config_path: Path) -> List[Tuple[str, List[str]]]:
+def load_wakewords() -> List[Tuple[str, List[str]]]:
     """
-    从 config.yaml 读取每个 agent 的唤醒词配置。
+    从 profile 配置读取唤醒词（合并去重）。
 
-    返回 [(name, [keywords...]), ...]：
-    - keywords 取 agents[].keywords 列表；
-    - agent 未配置 keywords 时回退为 [name]；
-    - 每个唤醒词文本去空、去重（全局只保留首次出现）。
-    配置缺失/读取失败/无 agents 时返回 []。
+    配置结构：``wakewords: {名字: {keywords: [触发词, ...]}}``
+    - **名字**：会话身份（chat_id = "wake:<名字>"），raw 行 @ 后缀
+    - **keywords**：触发词（sherpa KWS 实际检测的短语，可多个；
+      建议用较长短语如"小布小布"避免单字/双字误判）；
+      未配置 keywords 时回退为 [名字]（不推荐）
+
+    来源：
+    1. ~/.hermes/config.yaml 的 platforms.voice.extra.wakewords
+    2. ~/.hermes/voice-agent.yaml 的 wakewords（可选）
+
+    返回 [(name, [keywords...]), ...]。配置缺失/读取失败时返回 []。
     """
-    if not config_path.exists():
-        return []
+    combined: dict = {}
+    # 1) gateway 平台配置（唤醒词的权威来源）
     try:
         import yaml
-        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        gw_path = profile_root() / "config.yaml"
+        if gw_path.is_file():
+            gw = yaml.safe_load(gw_path.read_text(encoding="utf-8")) or {}
+            ww = (((gw.get("platforms") or {}).get("voice") or {})
+                  .get("extra", {}).get("wakewords"))
+            if isinstance(ww, dict):
+                combined.update(ww)
+            elif isinstance(ww, list):
+                combined.update({str(w): {} for w in ww})
     except Exception as e:
-        print(f"  ⚠️  读取配置失败，跳过自动同步: {config_path} ({e})")
-        return []
-    agents = cfg.get("voice", {}).get("agents", [])
-    if not agents:
-        return []
+        print(f"  ⚠️  读取 {profile_root() / 'config.yaml'} 失败: {e}")
+    # 2) voice-agent.yaml 的 wakewords（可选补充）
+    vcfg = load_voice_config()
+    ww2 = vcfg.get("wakewords")
+    if isinstance(ww2, dict):
+        combined.update(ww2)
+    elif isinstance(ww2, list):
+        combined.update({str(w): {} for w in ww2})
+
     result: List[Tuple[str, List[str]]] = []
-    seen: set = set()  # 全局去重
-    for ac in agents:
-        if not isinstance(ac, dict):
+    seen: set = set()
+    for name, conf in combined.items():
+        name = str(name).strip()
+        if not name or name in seen:
             continue
-        name = str(ac.get("name") or "").strip()
-        if not name:
-            continue
-        keywords = ac.get("keywords") or [name]
-        cleaned = []
-        for kw in keywords:
-            kw = str(kw).strip()
-            if not kw or kw in seen:
-                continue
-            seen.add(kw)
-            cleaned.append(kw)
-        if cleaned:
-            result.append((name, cleaned))
+        seen.add(name)
+        if isinstance(conf, dict):
+            kws = conf.get("keywords")
+            keywords = [str(k).strip() for k in kws if str(k).strip()] \
+                if isinstance(kws, list) else [name]
+        else:
+            keywords = [name]
+        result.append((name, keywords))
     return result
 
 
 def write_raw_keywords(raw_path: Path, agents_keywords: List[Tuple[str, List[str]]]) -> int:
     """
-    根据 config.yaml 中的 agents[].keywords 重写 raw_keywords.txt。
+    根据 profile 配置中的唤醒词重写 raw_keywords.txt。
 
     每行格式: <keyword> @<name>（name 中的空格以下划线代替）。
     返回写入的唤醒词总数。
     """
     lines = [
-        "# 本文件由 tools/gen_keywords.py 从 config.yaml 的 agents[].keywords 自动生成",
-        "# 格式: <phoneme_text> @<original>，@ 后缀为 agent 的 name（下划线代替空格）",
-        "# 手动修改会被下次运行脚本覆盖；请直接编辑 config.yaml 后重跑脚本",
+        "# 本文件由 tools/gen_keywords.py 从 profile 配置（platforms.voice.extra.wakewords）自动生成",
+        "# 格式: <phoneme_text> @<original>，@ 后缀为唤醒词名（下划线代替空格）",
+        "# 手动修改会被下次运行脚本覆盖；请直接修改唤醒词配置后重跑脚本",
         "#",
     ]
     count = 0
@@ -257,18 +274,19 @@ def write_raw_keywords(raw_path: Path, agents_keywords: List[Tuple[str, List[str
 # ---------------------------------------------------------------------------
 
 def main():
+    default_model_dir = resolve_kws_model_dir(load_voice_config())
     p = argparse.ArgumentParser(
         description="sherpa-onnx 唤醒词生成工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model-dir", type=str, default=None,
-                   help=f"模型目录（默认 {DEFAULT_MODEL_DIR}）")
+                   help=f"模型目录（默认 {default_model_dir}）")
     p.add_argument("--input", "-i", type=str, default=None,
                    help="raw_keywords.txt 路径（默认 <model-dir>/raw_keywords.txt）")
     p.add_argument("--output", "-o", type=str, default=None,
                    help="输出 keywords.txt 路径（默认 <model-dir>/keywords.txt）")
     p.add_argument("--init", action="store_true",
-                   help="创建 raw_keywords.txt 模板（使用 config.yaml 中的 wake_word.keyword）")
+                   help="创建 raw_keywords.txt 模板（使用 profile 配置中的第一个唤醒词）")
 
     args = p.parse_args()
 
@@ -276,11 +294,11 @@ def main():
     if args.model_dir:
         model_path = Path(args.model_dir)
     else:
-        model_path = DEFAULT_MODEL_DIR
+        model_path = default_model_dir
 
     if not model_path.exists():
         print(f"❌ 模型目录不存在: {model_path}")
-        print("   请先下载模型或指定正确的 --model-dir")
+        print("   请先下载模型（python -u tools/download_models.py）或指定 --model-dir")
         sys.exit(1)
 
     raw_path = Path(args.input) if args.input else model_path / "raw_keywords.txt"
@@ -292,12 +310,11 @@ def main():
             print(f"⚠️  文件已存在: {raw_path}")
             print("   使用 --input 指定其他路径，或删除已有文件")
             return
-        # 从 config.yaml 读取第一个 agent 的 name/keywords 作为默认模板
-        config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+        # 从 profile 配置读取第一个唤醒词作为默认模板
         default_keyword = "赫尔墨斯"
-        agents_keywords = load_agents_keywords(config_path)
-        if agents_keywords:
-            name, keywords = agents_keywords[0]
+        wakewords = load_wakewords()
+        if wakewords:
+            name, keywords = wakewords[0]
             default_keyword = keywords[0] if keywords else name
         raw_path.write_text(
             f"# sherpa-onnx 唤醒词列表\n"
@@ -311,16 +328,15 @@ def main():
         print(f"     编辑后运行: python -u tools/gen_keywords.py")
         return
 
-    # --- 自动同步：未显式指定 --input 时，从 config.yaml 同步 raw_keywords.txt ---
+    # --- 自动同步：未显式指定 --input 时，从 profile 配置同步 raw_keywords.txt ---
     if not args.input:
-        config_path = Path(__file__).resolve().parent.parent / "config.yaml"
-        agents_keywords = load_agents_keywords(config_path)
-        if agents_keywords:
-            n = write_raw_keywords(raw_path, agents_keywords)
-            print(f"  📋 已从 {config_path} 同步 {n} 个唤醒词 → {raw_path}")
-            print(f"     源配置: {config_path.name} 中 agents[].keywords")
+        wakewords = load_wakewords()
+        if wakewords:
+            n = write_raw_keywords(raw_path, wakewords)
+            print(f"  📋 已从 profile 配置同步 {n} 个触发词 → {raw_path}")
+            print(f"     源配置: platforms.voice.extra.wakewords（名字 → keywords 触发词）")
         else:
-            print(f"  ⚠️  config.yaml 无 agents 配置，使用已有 {raw_path}")
+            print(f"  ⚠️  profile 配置无唤醒词，使用已有 {raw_path}")
 
     # --- 生成 ---
     generate_keywords(raw_path, output_path)

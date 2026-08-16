@@ -48,6 +48,15 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+# 语音配置与路径约定（profile 目录，无 gateway 依赖的公共模块）
+from ..profile_config import (
+    load_voice_config,
+    models_dir,
+    resolve_kws_model_dir,
+    resolve_voiceprint_lib_dir,
+    voice_config_path,
+)
+
 logger = logging.getLogger(__name__)
 
 # 语音会话 chat_id 前缀：唤醒词 <名> → chat_id "wake:<名>"
@@ -178,7 +187,7 @@ class VoiceAdapter(BasePlatformAdapter):
              config.yaml 的 voice 段同构）
         不再读取插件源码目录/项目 config.yaml —— 配置归用户 profile 所有。
         """
-        base = load_profile_voice_config()
+        base = load_voice_config()
         # extra 顶层键直接覆盖语音配置的对应段
         merged = dict(base)
         for key, value in self._extra.items():
@@ -271,11 +280,15 @@ class VoiceAdapter(BasePlatformAdapter):
         mic = vcfg.get("mic", {}) or {}
         front_cfg = VoiceFrontendConfig(
             wake_word_enabled=wake.get("enabled", True),
-            wake_word_keyword=next(iter(self._wakewords), wake.get("keyword", "赫尔墨斯")),
+            # keywords.txt 由 tools/gen_keywords.py 生成（触发词 @名字）；
+            # wake_word_keyword 仅用于 keywords.txt 缺失时的兜底自动生成，
+            # 取第一个触发词（而非名字），避免单/双字误唤醒
+            wake_word_keyword=self._first_trigger_keyword()
+            or wake.get("keyword", "赫尔墨斯"),
             wake_word_threshold=float(kws.get("threshold", wake.get("sensitivity", 0.25))),
             # 模型目录统一走 voice-agent.yaml 的 kws.model_dir（绝对路径），
             # 不依赖插件源码目录
-            kws_model_dir=str(_resolve_kws_model_dir(vcfg)),
+            kws_model_dir=str(resolve_kws_model_dir(vcfg)),
             kws_model_name=kws.get("model_name",
                                    "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"),
             kws_encoder=kws.get("encoder", "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx"),
@@ -570,6 +583,21 @@ class VoiceAdapter(BasePlatformAdapter):
 
     # ─── 工具 ────────────────────────────────────────────
 
+    def _first_trigger_keyword(self) -> str:
+        """第一个触发词（wakewords 配置的 keywords 列表首项）。
+
+        触发词与名字分离：名字是会话身份（chat_id=wake:<名字>），
+        触发词是 sherpa KWS 实际检测的短语（建议较长，避免误唤醒）。
+        """
+        for conf in self._wakewords.values():
+            if isinstance(conf, dict):
+                kws = conf.get("keywords")
+                if isinstance(kws, list):
+                    for kw in kws:
+                        if str(kw).strip():
+                            return str(kw).strip()
+        return ""
+
     def wake_chat_id(self, wake_name: str) -> str:
         return f"{WAKE_CHAT_PREFIX}{wake_name}"
 
@@ -585,39 +613,6 @@ class VoiceAdapter(BasePlatformAdapter):
 # ─── 前置检查 / 配置校验 ─────────────────────────────────
 
 
-def _profile_voice_config_path() -> Path:
-    """语音配置文件路径：profile 目录（hermes home）下的 voice-agent.yaml。
-
-    约定：~/.hermes/voice-agent.yaml（HERMES_HOME 可覆盖）。插件不读取
-    安装源码目录下的 config.yaml —— 配置归用户 profile 所有，便于分发。
-    """
-    try:
-        from hermes_cli.config import get_hermes_home
-        return get_hermes_home() / "voice-agent.yaml"
-    except Exception:
-        return Path.home() / ".hermes" / "voice-agent.yaml"
-
-
-def load_profile_voice_config() -> Dict[str, Any]:
-    """读取 profile 语音配置 voice-agent.yaml（不存在/解析失败返回空 dict）。
-
-    文件顶层与 voice_agent 的 config.yaml 同构（含 ``voice:`` 键）；
-    若无 ``voice:`` 键则把顶层直接视为语音配置段。
-    """
-    path = _profile_voice_config_path()
-    if not path.is_file():
-        return {}
-    try:
-        import yaml
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if not isinstance(data, dict):
-            return {}
-        return data.get("voice", data) if isinstance(data.get("voice"), dict) else data
-    except Exception as exc:
-        logger.warning("[voice] 读取 %s 失败: %s", path, exc)
-        return {}
-
-
 def _ensure_profile_env() -> None:
     """把 profile 目录的 .env（~/.hermes/.env）加载进进程环境（不覆盖已有值）。
 
@@ -626,44 +621,9 @@ def _ensure_profile_env() -> None:
     """
     try:
         from dotenv import load_dotenv
-        load_dotenv(_profile_voice_config_path().parent / ".env", override=False)
+        load_dotenv(voice_config_path().parent / ".env", override=False)
     except Exception:
         pass
-
-
-def _profile_models_dir() -> Path:
-    """profile 模型根目录（约定）：~/.hermes/models/。"""
-    return _profile_voice_config_path().parent / "models"
-
-
-def _resolve_kws_model_dir(cfg: Dict[str, Any]) -> Path:
-    """解析 sherpa KWS 模型目录（约定路径）。
-
-    约定：<profile>/models/sherpa-kws/<model_name>，配置只需指定
-    ``kws.model_name``，无需指定 model_dir。显式配置 model_dir 仍兼容
-    （不推荐）。
-    """
-    kws = (cfg.get("kws") or {}) if isinstance(cfg, dict) else {}
-    raw = kws.get("model_dir")
-    if raw:
-        p = Path(raw)
-        if p.is_absolute():
-            return p
-        return _profile_voice_config_path().parent / p
-    name = kws.get("model_name") or "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
-    return _profile_models_dir() / "sherpa-kws" / name
-
-
-def _resolve_voiceprint_lib_dir(cfg: Dict[str, Any]) -> Path:
-    """声纹特征库目录（约定）：<profile>/models/voiceprint_lib/。"""
-    vp = (cfg.get("voiceprint") or {}) if isinstance(cfg, dict) else {}
-    raw = vp.get("lib_dir")
-    if raw:
-        p = Path(raw)
-        if p.is_absolute():
-            return p
-        return _profile_voice_config_path().parent / p
-    return _profile_models_dir() / "voiceprint_lib"
 
 
 def check_requirements() -> bool:
@@ -677,7 +637,7 @@ def check_requirements() -> bool:
     if missing:
         logger.warning("[voice] 缺少腾讯云凭据: %s", ", ".join(missing))
         return False
-    model_dir = _resolve_kws_model_dir(load_profile_voice_config())
+    model_dir = resolve_kws_model_dir(load_voice_config())
     if not model_dir.is_dir():
         logger.warning("[voice] sherpa 模型目录不存在: %s", model_dir)
         return False

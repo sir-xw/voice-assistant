@@ -33,6 +33,13 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+from voice_agent.profile_config import (
+    load_voice_config,
+    models_dir as profile_models_dir,
+    profile_root,
+    voice_config_path,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("download_models")
 
@@ -42,35 +49,6 @@ BASE_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
 DEFAULT_KWS_NAME = "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
 DEFAULT_PYANNOTE = "sherpa-onnx-pyannote-segmentation-3-0"
 DEFAULT_CAMPPLUS = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
-
-
-def profile_root() -> Path:
-    """hermes profile 目录（HERMES_HOME 或 ~/.hermes）。"""
-    env = __import__("os").environ.get("HERMES_HOME", "").strip()
-    if env:
-        return Path(env)
-    return Path.home() / ".hermes"
-
-
-def voice_config_path() -> Path:
-    return profile_root() / "voice-agent.yaml"
-
-
-def load_voice_config() -> dict:
-    path = voice_config_path()
-    if not path.is_file():
-        return {}
-    try:
-        import yaml
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        return data.get("voice", data) if isinstance(data.get("voice"), dict) else data
-    except Exception as exc:
-        logger.warning("读取 %s 失败: %s", path, exc)
-        return {}
-
-
-def models_dir() -> Path:
-    return profile_root() / "models"
 
 
 # ─── 检查与下载 ──────────────────────────────────────────
@@ -92,7 +70,7 @@ def download_to(url: str, dest: Path) -> None:
 
 def ensure_tar_model(name: str, category: str, force: bool = False) -> bool:
     """下载并解压 <category>/<name>.tar.bz2 到 profile/models/<category>/<name>/。"""
-    dest_dir = models_dir() / category / name
+    dest_dir = profile_models_dir() / category / name
     if dir_ready(dest_dir) and not force:
         logger.info("✔ %s/%s 已就绪", category, name)
         return True
@@ -125,7 +103,7 @@ def ensure_tar_model(name: str, category: str, force: bool = False) -> bool:
 
 def ensure_file_model(filename: str, category: str, force: bool = False) -> bool:
     """下载单个文件模型（如 CAM++ onnx）到 profile/models/<category>/<filename>。"""
-    dest = models_dir() / category / filename
+    dest = profile_models_dir() / category / filename
     if dest.is_file() and not force:
         logger.info("✔ %s/%s 已就绪", category, filename)
         return True
@@ -158,7 +136,7 @@ def main() -> int:
         os.environ["HERMES_HOME"] = args.profile
 
     cfg = load_voice_config()
-    md = models_dir()
+    md = profile_models_dir()
     md.mkdir(parents=True, exist_ok=True)
     logger.info("profile: %s", profile_root())
     logger.info("模型目录: %s", md)
@@ -173,7 +151,7 @@ def main() -> int:
     kws_name = kws.get("model_name") or DEFAULT_KWS_NAME
     logger.info("== KWS 唤醒词: %s ==", kws_name)
     if args.check:
-        if not dir_ready(models_dir() / "sherpa-kws" / kws_name):
+        if not dir_ready(profile_models_dir() / "sherpa-kws" / kws_name):
             logger.warning("缺失: sherpa-kws/%s", kws_name)
             ok = False
     else:
@@ -184,7 +162,7 @@ def main() -> int:
     if asr_name:
         logger.info("== 本地 ASR: %s ==", asr_name)
         if args.check:
-            if not dir_ready(models_dir() / "sherpa-asr" / asr_name):
+            if not dir_ready(profile_models_dir() / "sherpa-asr" / asr_name):
                 logger.warning("缺失: sherpa-asr/%s", asr_name)
                 ok = False
         else:
@@ -196,10 +174,10 @@ def main() -> int:
         camp_name = models_cfg.get("campplus") or DEFAULT_CAMPPLUS
         logger.info("== 说话人识别: %s / %s ==", spk_name, camp_name)
         if args.check:
-            if not dir_ready(models_dir() / "sherpa-spk" / spk_name):
+            if not dir_ready(profile_models_dir() / "sherpa-spk" / spk_name):
                 logger.warning("缺失: sherpa-spk/%s", spk_name)
                 ok = False
-            if not (models_dir() / "sherpa-spk" / camp_name).is_file():
+            if not (profile_models_dir() / "sherpa-spk" / camp_name).is_file():
                 logger.warning("缺失: sherpa-spk/%s", camp_name)
                 ok = False
         else:
@@ -207,7 +185,7 @@ def main() -> int:
             ok &= ensure_file_model(camp_name, "sherpa-spk", force=args.force)
 
     # 4) 声纹特征库目录（运行时生成，仅确保存在）
-    lib_dir = models_dir() / "voiceprint_lib"
+    lib_dir = profile_models_dir() / "voiceprint_lib"
     lib_dir.mkdir(parents=True, exist_ok=True)
     logger.info("✔ %s 就绪（特征库由运行时生成）", lib_dir)
 
