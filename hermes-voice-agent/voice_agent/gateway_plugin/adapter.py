@@ -66,6 +66,7 @@ _SYSTEM_NOTICE_PREFIXES = (
 # 项目根（voice_agent/gateway_plugin/ → 项目根）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 NOTIFICATION_PATH = PROJECT_ROOT / "assets" / "notification.wav"
+PROMPT_PATH = PROJECT_ROOT / "assets" / "prompt.wav"
 
 # ─── (情绪)文字 分段解析（与 VoiceApp 保持一致）────────────
 
@@ -290,8 +291,32 @@ class VoiceAdapter(BasePlatformAdapter):
             conversation_window_sec=self._conversation_window_sec,
             on_wake_word=self._on_wake_word,
             on_interrupt_request=self._on_interrupt_request,
+            on_play_prompt=self._play_prompt,
+            prompt_duration_sec=self._prompt_duration_sec(),
         )
         self._frontend = VoiceFrontend(front_cfg, self._asr)
+
+    def _prompt_duration_sec(self) -> float:
+        """读取唤醒提示音 wav 的实际时长（秒），供唤醒后静音保护期使用。"""
+        try:
+            import wave
+            with wave.open(str(PROMPT_PATH), "rb") as wf:
+                return wf.getnframes() / wf.getframerate()
+        except Exception:
+            return 1.0
+
+    def _play_prompt(self) -> None:
+        """唤醒词命中提示音（greeting）：VoiceFrontend 唤醒时回调播放。"""
+        if self._player is None or not PROMPT_PATH.exists():
+            return
+        try:
+            import wave
+            with wave.open(str(PROMPT_PATH), "rb") as wf:
+                data = wf.readframes(wf.getnframes())
+            self._player.feed(data)
+            logger.info("[voice] 🔊 播放唤醒提示音")
+        except Exception as exc:
+            logger.warning("[voice] 唤醒提示音播放失败: %s", exc)
 
     async def disconnect(self) -> None:
         """停止语音组件与监听。"""
