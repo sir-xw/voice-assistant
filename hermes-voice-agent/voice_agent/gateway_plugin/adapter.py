@@ -34,8 +34,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform, PlatformConfig
@@ -50,6 +52,44 @@ logger = logging.getLogger(__name__)
 
 # 语音会话 chat_id 前缀：唤醒词 <名> → chat_id "wake:<名>"
 WAKE_CHAT_PREFIX = "wake:"
+
+# 项目根（voice_agent/gateway_plugin/ → 项目根）
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+NOTIFICATION_PATH = PROJECT_ROOT / "assets" / "notification.wav"
+
+# ─── (情绪)文字 分段解析（与 VoiceApp 保持一致）────────────
+
+VALID_EMOTIONS = {
+    "neutral", "sad", "happy", "angry", "fear",
+    "story", "poetry", "sajiao", "disgusted", "amaze",
+    "exciting", "aojiao", "jieshuo",
+}
+EMOTION_PATTERN = re.compile(
+    r"\((?:%s)\)" % "|".join(sorted(VALID_EMOTIONS)), re.IGNORECASE)
+
+
+def parse_emotion_segments(response: str) -> List[tuple[str, str]]:
+    """解析 (情绪)文字内容 格式，支持多个情绪标记分段（与 VoiceApp 同一语义）。"""
+    response = response.strip().replace('（', '(').replace('）', ')')
+    if not response:
+        return []
+    matches = list(EMOTION_PATTERN.finditer(response))
+    if not matches:
+        return [("", response)]
+    segments: List[tuple[str, str]] = []
+    if matches[0].start() > 0:
+        head = response[:matches[0].start()].strip()
+        if head:
+            segments.append(("", head))
+    for i, m in enumerate(matches):
+        emotion = m.group(0)[1:-1].strip().lower()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
+        text = response[start:end].strip()
+        if text:
+            segments.append((emotion, text))
+    return segments
+
 
 # 模块级"当前语音适配器"（单实例假设）：供 post_api_request 全局钩子
 # 把中间轮文本投递到语音播放队列。
@@ -148,7 +188,7 @@ class VoiceAdapter(BasePlatformAdapter):
             vcfg = self._resolve_voice_cfg()
             self._init_asr(vcfg)
             self._init_frontend(vcfg)
-            # TODO(阶段 2): 装配 tts_engine + audio_player + 播报队列
+            self._init_playback(vcfg)
             _set_active_instance(self)
             self._frontend.start()
             logger.info("[voice] 语音平台已连接（唤醒词: %s）",
@@ -157,6 +197,31 @@ class VoiceAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[voice] connect 失败: %s", exc)
             return False
+
+    def _init_playback(self, vcfg: Dict[str, Any]) -> None:
+        """装配腾讯云 TTS + 音频播放器，启动播报串行队列。"""
+        from voice_agent.audio_player import AudioPlayer, AudioPlayerConfig
+        from voice_agent.tts_engine import TencentCloudTTSEngine, TencentTTSConfig
+
+        tts_cfg = vcfg.get("tts", {})
+        if tts_cfg.get("enabled", True):
+            self._tts = TencentCloudTTSEngine(TencentTTSConfig(
+                secret_id=os.getenv("VOICE_SecretId", ""),
+                secret_key=os.getenv("VOICE_SecretKey", ""),
+                app_id=os.getenv("VOICE_AppId", ""),
+                voice_type=tts_cfg.get("voice_type", 101001),
+                codec=tts_cfg.get("codec", "pcm"),
+                sample_rate=tts_cfg.get("sample_rate", 16000),
+                speed=tts_cfg.get("speed", 0.0),
+                volume=tts_cfg.get("volume", 0.0),
+            ))
+            self._player = AudioPlayer(AudioPlayerConfig())
+            self._player.start()
+            self._tts.on_audio_chunk = self._player.feed
+
+        # 播报串行队列：所有会话回复 + 中间轮钩子共用，单消费者
+        self._playback_queue = asyncio.Queue()
+        self._playback_task = asyncio.create_task(self._playback_consumer())
 
     def _init_asr(self, vcfg: Dict[str, Any]) -> None:
         """装配腾讯云 ASR 引擎（凭据来自 env VOICE_*，与现有 voice_agent 一致）。"""
@@ -220,9 +285,11 @@ class VoiceAdapter(BasePlatformAdapter):
         if self._playback_task:
             self._playback_task.cancel()
             self._playback_task = None
+        if self._player:
+            self._player.stop()
         logger.info("[voice] 语音平台已断开")
 
-    # ─── outbound：gateway 回复 → 播报（阶段 2 实现）─────
+    # ─── outbound：gateway 回复 → 播报 ───────────────────
 
     async def send(
         self,
@@ -233,13 +300,112 @@ class VoiceAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """把 agent 回复播报给用户。
 
-        阶段 2 实现：解析 (情绪)文字 分段 → 投入全局播报队列（串行）→
-        腾讯云 TTS 流式播放 → 通知音 → 进入对话窗口期。
-        播放放后台任务执行，send 快速返回，不阻塞 gateway 事件循环。
+        解析 (情绪)文字 分段 → 投入全局播报队列（串行）→ TTS 流式播放 →
+        通知音 → 进入对话窗口期。播放由后台消费者执行，send 快速返回。
+        [FINISH]（播放控制工具结束标记）不播报，直接关闭对话窗口。
         """
-        # TODO(阶段 2)
-        logger.info("[voice] send → %s: %s", chat_id, content[:60])
+        text = (content or "").strip()
+        if not text or self._playback_queue is None:
+            return SendResult(success=False, error="播报队列未就绪")
+
+        if text.upper().strip("[]") == "FINISH":
+            logger.info("[voice] [FINISH] 关闭对话窗口")
+            self._close_conversation_window()
+            return SendResult(success=True)
+
+        segments = parse_emotion_segments(text)
+        if not segments:
+            return SendResult(success=True)
+
+        wake = chat_id[len(WAKE_CHAT_PREFIX):] \
+            if chat_id.startswith(WAKE_CHAT_PREFIX) else chat_id
+        if self._identity_prefix and wake:
+            emo, first = segments[0]
+            segments[0] = (emo, f"我是{wake}，{first}")
+        await self._playback_queue.put((wake, segments, True))
+        logger.info("[voice] send → %s: %s", wake, text[:60])
         return SendResult(success=True)
+
+    async def _playback_consumer(self) -> None:
+        """播报队列消费者：串行播放所有会话的回复（含中间轮钩子投递）。"""
+        try:
+            while True:
+                wake, segments, is_final = await self._playback_queue.get()
+                try:
+                    await self._play_segments(wake, segments, is_final)
+                except Exception as exc:
+                    logger.warning("[voice] 播报失败: %s", exc)
+        except asyncio.CancelledError:
+            logger.info("[voice] 播报队列已停止")
+
+    async def _play_segments(
+        self, wake: str, segments: List[tuple[str, str]], is_final: bool
+    ) -> None:
+        """TTS 流式播放一段或多段情绪文本。
+
+        is_final=True（最终回复）：播完播通知音并进入对话窗口期；
+        is_final=False（中间轮）：只播报，不进对话窗口。
+        """
+        if not segments or self._tts is None or self._player is None:
+            return
+        from voice_agent.music_control import player_pause, player_resume
+
+        logger.info("[voice] 🔊 播报(%s): %d 段, 首段 %s...",
+                    "最终" if is_final else "中间", len(segments), segments[0][1][:30])
+        player_pause(force=True)
+        try:
+            if self._frontend:
+                self._frontend.set_tts_playing(True)
+            self._tts.on_audio_chunk = self._player.feed
+            for emotion, text in segments:
+                if not text or not text.strip():
+                    continue
+                self._tts.start()
+                if emotion:
+                    self._tts.set_emotion(emotion)
+                self._tts.synthesize(text)
+                self._tts.complete()
+                self._tts.wait(timeout=15)
+            self._player.wait_for_drain(timeout=15.0)
+            time.sleep(0.15)
+
+            if is_final:
+                self._play_asset_notification()
+                if self._player:
+                    self._player.wait_for_drain(timeout=5.0)
+                    time.sleep(0.05)
+                # 播完进入连续对话窗口期：VAD 直接听，无需再喊唤醒词
+                if self._frontend:
+                    self._frontend.enter_conversation_window()
+        finally:
+            if self._tts:
+                self._tts.on_audio_chunk = self._player.feed
+            if self._frontend:
+                self._frontend.set_tts_playing(False)
+            player_resume()
+
+    def _play_asset_notification(self) -> None:
+        """播放通知音（最终回复播完的提示）。"""
+        if not NOTIFICATION_PATH.exists() or self._player is None:
+            return
+        try:
+            import wave
+            with wave.open(str(NOTIFICATION_PATH), "rb") as wf:
+                data = wf.readframes(wf.getnframes())
+            self._player.feed(data)
+        except Exception as exc:
+            logger.warning("[voice] 通知音播放失败: %s", exc)
+
+    def _close_conversation_window(self) -> None:
+        """关闭对话窗口（[FINISH] / 打断时），回到唤醒词监听。"""
+        if self._frontend is None:
+            return
+        try:
+            self._frontend._cancel_conversation_timer()
+            from voice_agent.voice_frontend import VoiceState
+            self._frontend._set_state(VoiceState.IDLE)
+        except Exception as exc:
+            logger.debug("[voice] 关闭对话窗口: %s", exc)
 
     # ─── inbound：语音 → gateway 会话 ────────────────────
 
@@ -250,9 +416,27 @@ class VoiceAdapter(BasePlatformAdapter):
                     self._current_wake, self.wake_chat_id(self._current_wake))
 
     def _on_interrupt_request(self) -> None:
-        """VoiceFrontend 在唤醒词命中/打断时调用：物理打断 TTS 播放（阶段 2）。"""
-        # TODO(阶段 2): self._tts.interrupt() + self._player.clear() + 清播报队列
-        logger.info("[voice] 打断请求（阶段 2 实现物理打断）")
+        """VoiceFrontend 在唤醒词命中/打断时调用：物理打断 TTS 播放并清播报队列。
+
+        agent 层的打断由 gateway busy_input_mode=interrupt 处理（同会话新消息
+        取消进行中 turn）；这里负责物理输出层（TTS + 扬声器 + 队列）。
+        """
+        try:
+            if self._tts:
+                self._tts.interrupt()
+            if self._player:
+                self._player.clear()
+            if self._loop is not None and self._playback_queue is not None:
+                async def _clear():
+                    while not self._playback_queue.empty():
+                        try:
+                            self._playback_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                asyncio.run_coroutine_threadsafe(_clear(), self._loop)
+            logger.info("[voice] 打断：TTS 停止 + 播放队列已清空")
+        except Exception as exc:
+            logger.warning("[voice] 打断处理异常: %s", exc)
 
     def _on_asr_complete(self) -> None:
         """ASR 整段识别完成（SDK 回调线程）：文本 → MessageEvent → gateway 会话。"""
@@ -348,12 +532,12 @@ def is_connected() -> bool:
 
 
 def on_post_api_request(**kwargs):
-    """post_api_request 钩子：中间轮文字回复直接播报。
+    """post_api_request 钩子：中间轮文字回复直接播报（替代已废除的 speak 工具）。
 
     - finish_reason == "tool_calls" 且 assistant_message.content 非空
       → 阶段文本 → 语音播报队列（无通知音、不进对话窗口）
     - finish_reason == "stop" → 忽略（最终回复由 gateway send() 播放，天然去重）
-    - content == "[FINISH]" → 通知适配器关闭对话窗口（不播报）
+    - content == "[FINISH]" → 关闭对话窗口（不播报）
     """
     adapter = _get_active_instance()
     if adapter is None:
@@ -366,10 +550,23 @@ def on_post_api_request(**kwargs):
         else:
             content = getattr(assistant, "content", None) or ""
         text = content.strip()
-        if not text or finish_reason == "stop":
+        if not text:
             return
-        # TODO(阶段 2): 投递到 adapter._playback_queue 播报
-        logger.info("[voice] 中间轮播报: %s", text[:60])
+        if text.upper().strip("[]") == "FINISH":
+            adapter._close_conversation_window()
+            return
+        if finish_reason == "stop":
+            return  # 最终回复由 send() 播放
+        segments = parse_emotion_segments(text)
+        if not segments:
+            return
+        wake = adapter._current_wake or ""
+        loop = adapter._loop
+        if loop is not None and adapter._playback_queue is not None:
+            asyncio.run_coroutine_threadsafe(
+                adapter._playback_queue.put((wake, segments, False)), loop
+            )
+            logger.info("[voice] 中间轮播报: %s", text[:60])
     except Exception as exc:
         logger.warning("[voice] post_api_request 钩子异常: %s", exc)
 
