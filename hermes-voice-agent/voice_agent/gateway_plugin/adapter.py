@@ -575,7 +575,17 @@ def on_post_api_request(**kwargs):
 
 
 def register(ctx) -> None:
-    """插件入口：注册语音平台 + 中间轮播报钩子。"""
+    """插件入口：注册语音平台 + 中间轮播报钩子 + 语音相关工具。"""
+    # 注册本项目工具（mpd 音乐播放控制等）到全局 registry；
+    # 是否对某个平台披露由 platform_toolsets.<platform> 控制
+    # （例如 platforms.voice 对应 toolset "voice_agent" 时才会被语音
+    # 会话的 agent 调用 —— 条件披露，不影响其他平台）。
+    try:
+        from voice_agent.mpd_tool import register_all as register_mpd_tools
+        register_mpd_tools()
+    except Exception as exc:
+        logger.warning("[voice] mpd 工具注册失败（可忽略）: %s", exc)
+
     ctx.register_platform(
         name="voice",
         label="语音",
