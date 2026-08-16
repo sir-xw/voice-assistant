@@ -211,13 +211,24 @@ def on_post_api_request(**kwargs):
       enabled: true
       extra:
         wakewords:
-          小布: { chat_id: "wake:小布", session_id: "hermes-voice-小布", system_prompt: "..." }
-          翻译助手: { chat_id: "wake:翻译助手", session_id: "hermes-voice-翻译助手", system_prompt: "..." }
+          小布: { chat_id: "wake:小布", session_id: "hermes-voice-小布" }
+          翻译助手: { chat_id: "wake:翻译助手", session_id: "hermes-voice-翻译助手" }
         # 腾讯云凭据走 env（VOICE_SecretId 等，与现有一致）
         conversation_window_sec: 5.0
         voiceprint: { enabled: false, ... }
   ```
 - 唤醒词命中 `小布` → `chat_id="wake:小布"` → gateway 独立会话（独立历史/上下文）。✓ 用户已确认此映射。
+- **每个唤醒词独立的 system_prompt / model / provider**：用 gateway 原生机制
+  `platforms.voice.channel_overrides`（`gateway/run.py::_get_channel_override`，
+  按 chat_id 精确匹配）：
+  ```yaml
+  platforms:
+    voice:
+      channel_overrides:
+        "wake:小布": { system_prompt: "你是家庭助手小布……" }
+        "wake:翻译助手": { system_prompt: "你是翻译助手……", model: "openai/gpt-4o-mini" }
+  ```
+  （已用 `PlatformConfig.from_dict` 验证解析与查询。）
 - 关键词文件：`models/sherpa-kws/<model>/keywords.txt` 继续由 `tools/gen_keywords.py` 生成（插件启动时校验存在，缺失则回退自动生成——复用现有逻辑）。
 
 ---
@@ -267,29 +278,31 @@ gateway 进程由 `hermes gateway` 启动，**没有 main.py 那样 patch 白名
 
 ## 8. 实施步骤
 
-### 阶段 0：可行性验证（无头环境可做）
-- [ ] 写最小 `VoiceAdapter` 骨架（connect/send/handle_message 空实现）注册为 platform，`hermes gateway` 能启动、`hermes plugins list`/`gateway status` 能看到 voice 平台（无需真实硬件，check_fn 放行）。
-- [ ] 确认同会话新消息 → `busy_input_mode: interrupt` 的打断路径（阅读/单测 gateway 行为）。
+### 阶段 0：可行性验证（无头环境可做）✅ 已完成
+- [x] 写最小 `VoiceAdapter` 骨架（connect/send/handle_message 空实现）注册为 platform，`hermes gateway` 能启动、`hermes plugins list`/`gateway status` 能看到 voice 平台（无需真实硬件，check_fn 放行）。
+- [x] 确认同会话新消息 → `busy_input_mode: interrupt` 的打断路径（阅读/单测 gateway 行为）。
 
-### 阶段 1：inbound（语音 → 会话）
-- [ ] 复用 voice_frontend + asr_engine，唤醒 → ASR → `MessageEvent` → `handle_message`。
-- [ ] 对话窗口期 VAD 直接进 ASR（适配器状态机）。
-- [ ] 说话人识别拼接（可选）。
+### 阶段 1：inbound（语音 → 会话）✅ 已完成
+- [x] 复用 voice_frontend + asr_engine，唤醒 → ASR → `MessageEvent` → `handle_message`。
+- [x] 对话窗口期 VAD 直接进 ASR（适配器状态机，复用 VoiceFrontend）。
+- [ ] 说话人识别拼接（可选，voiceprint 未接入适配器 inbound——待真机需求确认）。
 
-### 阶段 2：outbound（回复 → 播放）
-- [ ] `send()`：情绪分段解析 → 全局播报队列 → TTS 流式播放 → 通知音 → 对话窗口。
-- [ ] `post_api_request` 钩子：中间轮播报 + `[FINISH]` 关窗。
-- [ ] 播报串行化 + 身份前缀（取代待汇报）。
-- [ ] 打断：物理打断（TTS/播放器）+ gateway interrupt 协同。
+### 阶段 2：outbound（回复 → 播放）✅ 已完成
+- [x] `send()`：情绪分段解析 → 全局播报队列 → TTS 流式播放 → 通知音 → 对话窗口。
+- [x] `post_api_request` 钩子：中间轮播报 + `[FINISH]` 关窗。
+- [x] 播报串行化 + 身份前缀（取代待汇报）。
+- [x] 打断：物理打断（TTS/播放器）+ gateway interrupt 协同。
 
-### 阶段 3：多唤醒词与会话映射
-- [ ] `wakewords` 配置 → chat_id → 会话 system prompt 绑定。
-- [ ] `keywords.txt` 生成/校验。
+### 阶段 3：多唤醒词与会话映射 ✅ 配置层已完成
+- [x] `wakewords` 配置 → chat_id → 会话绑定；per-session system_prompt/model
+      用 gateway 原生 `channel_overrides` 实现（已验证解析）。
+- [x] `keywords.txt` 生成/校验（复用 VoiceFrontend 现有逻辑）。
 
-### 阶段 4：部署切换
-- [ ] systemd unit 改造（`hermes gateway` + `Environment=HERMES_ENABLE_PROJECT_PLUGINS=1` 或插件装用户目录）。
-- [ ] `hermes plugins enable voice-platform`。
-- [ ] 真机冒烟（见 §9）。
+### 阶段 4：部署切换 📋 文档已就绪，待真机执行
+- [x] 部署/使用文档：`docs/gateway-voice-plugin-usage.md`
+      （pip 安装 + `hermes plugins enable voice-platform` + platforms.voice 配置 +
+      `platform_toolsets.voice` + systemd unit 改造 + 真机冒烟清单）。
+- [ ] 真机执行：停用 `hermes-voice-agent.service` → 启用 gateway 服务 → 冒烟。
 
 ---
 
@@ -315,8 +328,15 @@ gateway 进程由 `hermes gateway` 启动，**没有 main.py 那样 patch 白名
 
 ## 10. 待确认/开放项
 
-1. **插件加载方案**（§7.2 的 A/B/C）——是否接受写一次全局 `plugins.enabled`？
-2. **mpd 工具注册**：gateway 进程如何获得 `mpd_*` 工具（插件 `register()` 里调 `register_mpd_tools()`，或配置 gateway 工具集）。
-3. **身份前缀**：多唤醒词共用扬声器时，非当前"激活"会话的回复是否加"我是{唤醒词}，"前缀（默认建议加，可配置关闭）。
-4. **speech-relay / plugin_hooks** 是否退役删除（建议：gateway 模式不再需要，VoiceApp 模式保留至下线）。
-5. **gateway 的会话系统提示词**机制确认：`chat_id → system_prompt` 绑定方式（gateway 支持会话级 system prompt 注入，具体接口需在阶段 1 确认）。
+1. **插件加载方案** ✅ 已定：作为正式插件，接受全局 `plugins.enabled`
+   （`hermes plugins enable voice-platform`），项目开放给所有 hermes-agent 用户
+   （entry-point 分发，pip 安装即注册）。
+2. **mpd 工具注册** ✅ 已实现：register() 注册 mpd_* 到 `voice_agent` toolset，
+   披露由 `platform_toolsets.voice: [voice_agent]` 控制（只对语音平台开放）。
+3. **身份前缀** ✅ 已实现：`extra.identity_prefix` 可配置（默认 true）。
+4. **speech-relay / plugin_hooks**：VoiceApp 模式保留（未删除）；gateway 模式
+   不需要（钩子已移入 voice-platform 自带）。VoiceApp 整体下线后再清理。
+5. **多唤醒词提示词差异** ✅ 已定：gateway 原生 `channel_overrides`
+   （per-chat system_prompt/model/provider），已验证配置解析。
+6. **说话人识别接入适配器**：voiceprint 未接入 gateway inbound（VoiceApp 有）。
+   真机需求确认后再接（`_vp_round` 拼接逻辑搬入适配器 `_on_asr_complete`）。
