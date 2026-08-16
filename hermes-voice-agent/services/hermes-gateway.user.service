@@ -1,0 +1,49 @@
+# Hermes Agent Gateway —— root 用户服务模板（voice-platform 语音平台）
+#
+# 为什么用"用户服务"而非系统服务：
+#   系统服务（/etc/systemd/system/）不在 root 的用户会话里，连不到
+#   per-user 的 pipewire/pulse 音频栈，voice 平台无法打开麦克风/扬声器。
+#   用户服务运行在 user@0.slice，可访问音频设备。
+#
+# 安装：
+#   mkdir -p ~/.config/systemd/user/hermes-gateway.service.d
+#   cp services/hermes-gateway.user.service ~/.config/systemd/user/hermes-gateway.service
+#   cp services/hermes-gateway.audio-dropin.conf \
+#      ~/.config/systemd/user/hermes-gateway.service.d/audio.conf
+#   loginctl enable-linger root                 # 无登录会话也开机自启
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hermes-gateway
+#
+# 注意：hermes 启动时会重写主 unit（"Updated gateway user service definition"），
+# 音频依赖请保留在 drop-in（.service.d/audio.conf），不会被覆盖。
+
+[Unit]
+Description=Hermes Agent Gateway - Messaging Platform Integration (user service)
+After=network-online.target pipewire.service pipewire-pulse.service pulseaudio.service
+Wants=network-online.target pipewire-pulse.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
+WorkingDirectory=/root/.hermes
+Environment="XDG_RUNTIME_DIR=/run/user/0"
+Environment="HOME=/root"
+Environment="HERMES_HOME=/root/.hermes"
+Environment="PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/bin:/root/.local/bin:/root/.cargo/bin:/root/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv"
+Restart=always
+RestartSec=5
+RestartMaxDelaySec=300
+RestartSteps=5
+RestartForceExitStatus=75
+RestartPreventExitStatus=78
+KillMode=mixed
+KillSignal=SIGTERM
+ExecReload=/bin/kill -USR1 $MAINPID
+TimeoutStopSec=210
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
