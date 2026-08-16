@@ -35,6 +35,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform, PlatformConfig
@@ -83,6 +84,7 @@ class VoiceAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=platform)
 
         extra = config.extra or {}
+        self._extra = extra
         self._wakewords: Dict[str, dict] = extra.get("wakewords") or {}
         self._conversation_window_sec = float(
             extra.get("conversation_window_sec", 5.0)
@@ -90,32 +92,65 @@ class VoiceAdapter(BasePlatformAdapter):
         # 身份前缀：多唤醒词共用扬声器时，播报前加 "我是{唤醒词}，"
         self._identity_prefix = bool(extra.get("identity_prefix", True))
 
-        # 语音组件（阶段 1/2 装配，connect 时创建）
+        # gateway 事件循环（connect 时记录，供 SDK 回调线程投递）
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # 语音组件（connect 时装配）
         self._frontend = None       # voice_frontend（唤醒词/VAD/麦克风）
         self._asr = None            # TencentCloudASREngine
         self._tts = None            # TencentCloudTTSEngine
         self._player = None         # AudioPlayer
+        # 当前命中的唤醒词（_on_wake_word 记录，on_complete 时使用）
+        self._current_wake: Optional[str] = None
         # 播报串行队列（阶段 2）：所有会话回复 + 中间轮钩子共用，单消费者
         self._playback_queue: Optional[asyncio.Queue] = None
         self._playback_task: Optional[asyncio.Task] = None
 
+    # ─── 配置解析 ────────────────────────────────────────
+
+    def _resolve_voice_cfg(self) -> Dict[str, Any]:
+        """合并插件配置与 voice_agent 默认配置。
+
+        优先 platforms.voice.extra；未配置项回退到 voice_agent 的默认/
+        项目 config.yaml（复用现有 ASR/VAD/唤醒词等默认值）。
+        """
+        try:
+            from voice_agent.config import load_config
+            base = (load_config() or {}).get("voice", {})
+        except Exception:
+            base = {}
+        # extra 顶层键直接覆盖 voice 配置的对应段
+        merged = dict(base)
+        for key, value in self._extra.items():
+            if key in ("wakewords", "identity_prefix", "conversation_window_sec",
+                       "kws", "asr", "vad", "tts", "voiceprint", "mic"):
+                if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                    merged[key] = {**merged[key], **value}
+                else:
+                    merged[key] = value
+        return merged
+
     # ─── 生命周期 ────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """初始化语音组件并启动监听。
+        """初始化语音组件（唤醒词 + VAD + 麦克风 + 腾讯云 ASR）并启动监听。
 
-        阶段 0：先完成配置校验与组件初始化（失败降级告警，不让 gateway 崩溃）；
-        阶段 1 起：启动唤醒词监听与 ASR。
+        inbound 链路：sherpa 唤醒词命中 → VAD 确认人声 → 腾讯云 ASR →
+        on_complete（last_text）→ MessageEvent → gateway 会话。
         """
+        self._loop = asyncio.get_running_loop()
         try:
             ok, reason = check_requirements()
             if not ok:
                 logger.warning("[voice] 前置检查未通过: %s", reason)
                 return False
+
+            vcfg = self._resolve_voice_cfg()
+            self._init_asr(vcfg)
+            self._init_frontend(vcfg)
+            # TODO(阶段 2): 装配 tts_engine + audio_player + 播报队列
             _set_active_instance(self)
-            # TODO(阶段 1): 装配 voice_frontend + asr_engine，绑定
-            #   _on_wake_word / _on_asr_final 回调，启动麦克风
-            # TODO(阶段 2): 装配 tts_engine + audio_player，启动播报队列
+            self._frontend.start()
             logger.info("[voice] 语音平台已连接（唤醒词: %s）",
                         ", ".join(self._wakewords) or "(未配置)")
             return True
@@ -123,13 +158,68 @@ class VoiceAdapter(BasePlatformAdapter):
             logger.error("[voice] connect 失败: %s", exc)
             return False
 
+    def _init_asr(self, vcfg: Dict[str, Any]) -> None:
+        """装配腾讯云 ASR 引擎（凭据来自 env VOICE_*，与现有 voice_agent 一致）。"""
+        from voice_agent.asr_engine import TencentASRConfig, TencentCloudASREngine
+
+        asr_cfg = vcfg.get("asr", {})
+        self._asr = TencentCloudASREngine(TencentASRConfig(
+            secret_id=os.getenv("VOICE_SecretId", ""),
+            secret_key=os.getenv("VOICE_SecretKey", ""),
+            app_id=os.getenv("VOICE_AppId", ""),
+            engine_model=asr_cfg.get("engine_model", "16k_zh"),
+            needvad=asr_cfg.get("needvad", False),
+            voice_format=asr_cfg.get("voice_format", 1),
+        ))
+        # 服务端 VAD 可能在用户句间停顿时提前回调 on_final，这里只认
+        # on_complete（整段说完）→ last_text 兜底，与 VoiceApp 一致
+        self._asr.on_final = None
+        self._asr.on_complete = self._on_asr_complete
+        self._asr.on_error = self._on_asr_error
+
+    def _init_frontend(self, vcfg: Dict[str, Any]) -> None:
+        """装配语音前端（唤醒词 + VAD + 麦克风 → ASR 桥接）。"""
+        from voice_agent.voice_frontend import VoiceFrontend, VoiceFrontendConfig
+
+        wake = vcfg.get("wake_word", {})
+        vad = vcfg.get("vad", {})
+        kws = vcfg.get("kws", {}) or {}
+        mic = vcfg.get("mic", {}) or {}
+        front_cfg = VoiceFrontendConfig(
+            wake_word_enabled=wake.get("enabled", True),
+            wake_word_keyword=next(iter(self._wakewords), wake.get("keyword", "赫尔墨斯")),
+            wake_word_threshold=float(kws.get("threshold", wake.get("sensitivity", 0.25))),
+            kws_model_dir=kws.get("model_dir", "models/sherpa-kws"),
+            kws_model_name=kws.get("model_name",
+                                   "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"),
+            kws_encoder=kws.get("encoder", "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx"),
+            kws_decoder=kws.get("decoder", "decoder-epoch-13-avg-2-chunk-8-left-64.onnx"),
+            kws_joiner=kws.get("joiner", "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx"),
+            kws_tokens=kws.get("tokens", "tokens.txt"),
+            vad_mode=int(vad.get("mode", 3)),
+            min_speech_ms=int(vad.get("min_speech_ms", 200)),
+            vad_silence_threshold_ms=int(vad.get("silence_threshold_ms", 600)),
+            vad_speech_confirm_frames=int(vad.get("speech_confirm_frames", 3)),
+            wake_guard_sec=float(vad.get("wake_guard_sec", 2.5)),
+            mic_sample_rate=int(mic.get("sample_rate", 0)),
+            mic_device=mic.get("device"),
+            conversation_window_sec=self._conversation_window_sec,
+            on_wake_word=self._on_wake_word,
+            on_interrupt_request=self._on_interrupt_request,
+        )
+        self._frontend = VoiceFrontend(front_cfg, self._asr)
+
     async def disconnect(self) -> None:
         """停止语音组件与监听。"""
         _set_active_instance(None)
+        if self._frontend:
+            try:
+                self._frontend.stop()
+            except Exception as exc:
+                logger.debug("[voice] frontend stop: %s", exc)
         if self._playback_task:
             self._playback_task.cancel()
             self._playback_task = None
-        # TODO(阶段 1): 停止 frontend / ASR
         logger.info("[voice] 语音平台已断开")
 
     # ─── outbound：gateway 回复 → 播报（阶段 2 实现）─────
@@ -151,15 +241,52 @@ class VoiceAdapter(BasePlatformAdapter):
         logger.info("[voice] send → %s: %s", chat_id, content[:60])
         return SendResult(success=True)
 
-    # ─── inbound：语音 → gateway 会话（阶段 1 实现）──────
+    # ─── inbound：语音 → gateway 会话 ────────────────────
 
     def _on_wake_word(self, name: str) -> None:
-        """唤醒词命中：开始录音（VAD 结束 → ASR）。阶段 1 实现。"""
-        raise NotImplementedError("阶段 1 实现")
+        """唤醒词命中（VoiceFrontend 音频处理线程）：记录命中的唤醒词。"""
+        self._current_wake = name or next(iter(self._wakewords), "")
+        logger.info("[voice] 唤醒词命中: %s → chat_id=%s",
+                    self._current_wake, self.wake_chat_id(self._current_wake))
 
-    def _on_asr_final(self, text: str, wake_name: str) -> None:
-        """ASR 最终文本 → MessageEvent → gateway 会话。阶段 1 实现。"""
-        raise NotImplementedError("阶段 1 实现")
+    def _on_interrupt_request(self) -> None:
+        """VoiceFrontend 在唤醒词命中/打断时调用：物理打断 TTS 播放（阶段 2）。"""
+        # TODO(阶段 2): self._tts.interrupt() + self._player.clear() + 清播报队列
+        logger.info("[voice] 打断请求（阶段 2 实现物理打断）")
+
+    def _on_asr_complete(self) -> None:
+        """ASR 整段识别完成（SDK 回调线程）：文本 → MessageEvent → gateway 会话。"""
+        try:
+            text = (self._asr.last_text or "").strip()
+            if not text:
+                logger.info("[voice] ASR 结果为空，跳过")
+                return
+            wake = self._current_wake or next(iter(self._wakewords), "")
+            logger.info("[voice] 用户说了: %s", text[:60])
+
+            source = self.build_source(
+                chat_id=self.wake_chat_id(wake),
+                chat_name=wake,
+                chat_type="dm",
+                user_id="voice-user",
+                user_name="用户",
+            )
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=f"voice-{int(time.time() * 1000)}",
+            )
+            # handle_message 是 async，需在 gateway 事件循环线程执行
+            if self._loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self.handle_message(event), self._loop
+                )
+        except Exception as exc:
+            logger.warning("[voice] ASR 完成处理异常: %s", exc)
+
+    def _on_asr_error(self, msg: str) -> None:
+        logger.error("[voice] ASR 错误: %s", msg)
 
     # ─── 工具披露（条件披露 mpd_* 等）───────────────────
 
