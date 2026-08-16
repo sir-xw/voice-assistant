@@ -27,14 +27,18 @@ hermes plugins enable voice-platform
 
 ### 1) `~/.hermes/voice-agent.yaml`（语音参数，全部可省略 = 内置默认）
 
-```yaml
-wake_word:
-  enabled: true
+本地模型统一存放在 `<profile>/models/`，配置只指定模型**名称**，不指定路径：
 
-# sherpa KWS 模型（绝对路径；相对路径基于 profile 目录解析）
+```yaml
+# sherpa KWS 唤醒词（目录约定 <profile>/models/sherpa-kws/<model_name>/）
 kws:
-  model_dir: "/path/to/models/sherpa-kws"
   model_name: "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+
+# 本地模型清单（tools/download_models.py 按此检查/下载）
+models:
+  asr: "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"  # 可选
+  # speaker: "sherpa-onnx-pyannote-segmentation-3-0"   # voiceprint 启用时
+  # campplus: "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
 
 # VAD（wake_guard_sec 唤醒后静音保护期，太短会导致 ASR 提前结束）
 vad:
@@ -47,13 +51,21 @@ mic:
   device: auto
 
 asr:
-  engine_model: "16k_zh_en_speaker_2.0"
+  engine_model: "16k_zh_en_speaker_2.0"   # 腾讯云在线 ASR
 
 tts:
   voice_type: 601009
 
 voiceprint:
   enabled: false
+```
+
+### 模型下载
+
+```bash
+# 检查并下载缺失模型（KWS 必需；models.asr 可选；voiceprint 启用时下载声纹模型）
+python -u tools/download_models.py
+python -u tools/download_models.py --check   # 仅检查
 ```
 
 ### 2) `~/.hermes/config.yaml`（平台开关与每会话配置）

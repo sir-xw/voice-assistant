@@ -631,14 +631,39 @@ def _ensure_profile_env() -> None:
         pass
 
 
+def _profile_models_dir() -> Path:
+    """profile 模型根目录（约定）：~/.hermes/models/。"""
+    return _profile_voice_config_path().parent / "models"
+
+
 def _resolve_kws_model_dir(cfg: Dict[str, Any]) -> Path:
-    """解析 sherpa KWS 模型目录：voice-agent.yaml 的 kws.model_dir（可绝对路径）。"""
+    """解析 sherpa KWS 模型目录（约定路径）。
+
+    约定：<profile>/models/sherpa-kws/<model_name>，配置只需指定
+    ``kws.model_name``，无需指定 model_dir。显式配置 model_dir 仍兼容
+    （不推荐）。
+    """
     kws = (cfg.get("kws") or {}) if isinstance(cfg, dict) else {}
-    raw = kws.get("model_dir") or "models/sherpa-kws"
-    p = Path(raw)
-    if p.is_absolute():
-        return p
-    return _profile_voice_config_path().parent / p
+    raw = kws.get("model_dir")
+    if raw:
+        p = Path(raw)
+        if p.is_absolute():
+            return p
+        return _profile_voice_config_path().parent / p
+    name = kws.get("model_name") or "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+    return _profile_models_dir() / "sherpa-kws" / name
+
+
+def _resolve_voiceprint_lib_dir(cfg: Dict[str, Any]) -> Path:
+    """声纹特征库目录（约定）：<profile>/models/voiceprint_lib/。"""
+    vp = (cfg.get("voiceprint") or {}) if isinstance(cfg, dict) else {}
+    raw = vp.get("lib_dir")
+    if raw:
+        p = Path(raw)
+        if p.is_absolute():
+            return p
+        return _profile_voice_config_path().parent / p
+    return _profile_models_dir() / "voiceprint_lib"
 
 
 def check_requirements() -> bool:
