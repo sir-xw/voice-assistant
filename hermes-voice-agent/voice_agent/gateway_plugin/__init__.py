@@ -15,8 +15,19 @@ voice-platform — hermes gateway 语音平台插件。
 
 分发方式：pyproject.toml 的 `hermes_agent.plugins` entry point 注册
 （pip 安装即成为 hermes 插件），亦可目录部署（plugin.yaml + 本模块）。
+
+注意：**本模块不得在顶层导入 `gateway.*`** —— providers/__init__.py 会遍历
+整个 `hermes_agent.plugins` entry-point 组并 `ep.load()` 每个目标模块，若顶层
+导入 gateway.config（部分初始化期）会触发循环导入告警。因此 register() 内
+延迟导入 adapter（真实加载发生在 PluginManager 路径，此时 gateway 已就绪）。
 """
 
-from .adapter import register
+
+def register(ctx):
+    """插件入口：延迟导入 adapter 并转发（避免 entry-point 扫描期循环导入）。"""
+    from .adapter import register as _register
+
+    return _register(ctx)
+
 
 __all__ = ["register"]
