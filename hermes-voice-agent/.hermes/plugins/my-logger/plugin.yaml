@@ -1,0 +1,4 @@
+# .hermes/plugins/my-logger/plugin.yaml
+name: my-logger
+version: "1.0"
+description: "记录llm response"

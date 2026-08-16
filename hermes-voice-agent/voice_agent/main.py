@@ -8,7 +8,9 @@ Hermes Agent 语音输入前端 — VoiceApp 应用逻辑。
   - Hermes Agent（Python 库，嵌入运行）
   - 腾讯云流式语音合成（TTS SDK）
   - 唤醒词打断 TTS + 代理对话
-  - AI 自主 speak 工具（阶段性汇报 + 最终回答）
+  - post_api_request 插件回调驱动语音播报（替代 speak 工具）：
+    每次 LLM 回复经 speech-relay 插件转发到播放队列实时播报，
+    最终回复（finish_reason=stop）播完后进入对话窗口
 
 本模块只定义 VoiceApp，不包含启动入口。
 启动方式见 __main__.py（python -m voice_agent）或项目根启动脚本。
@@ -28,11 +30,18 @@ from .tts_engine import TencentCloudTTSEngine, TencentTTSConfig
 from .music_control import player_pause, player_resume
 from .voice_frontend import VoiceFrontend, VoiceFrontendConfig, VoiceState
 
+# ─── 项目级插件引导 ──────────────────────────────────────
+# 必须在 AIAgent 构造之前调用（agent/agent_init.py 内部会触发插件发现并缓存状态）：
+# 让 ./.hermes/plugins 下的项目插件（speech-relay 等）在本进程加载，
+# 且不修改全局 ~/.hermes/config.yaml（进程内白名单替换）。
+from .plugin_hooks import ensure_project_plugins_loaded
+
+ensure_project_plugins_loaded()
+
 # Hermes Agent（嵌入运行）
 from run_agent import AIAgent
 
 # AI 工具注册
-from tools.registry import registry
 from .mpd_tool import register_all as register_mpd_tools
 
 logger = logging.getLogger("main")
@@ -61,10 +70,16 @@ class VoiceApp:
         self._active_name: str | None = None  # 当前由哪个唤醒词触发
         self._loop: asyncio.AbstractEventLoop | None = None
 
-        # speak 工具队列：AI 通过工具发起的语音播报请求
-        # 元素: (text, emotion)
-        self._speak_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
-        self._speak_consumer_task: asyncio.Task | None = None
+        # LLM 回复播放队列：post_api_request 回调（speech-relay 插件 → 播报桥）
+        # 把每次 LLM 回复投递到这里。
+        # 元素: (name, gen, segments, is_final)
+        #   segments 为 [(emotion, text), ...]（已解析的情绪分段）
+        #   is_final=True 表示 finish_reason=stop 的最终回复（播完进对话窗口）
+        self._reply_queue: asyncio.Queue[tuple[str, int, list, bool]] = asyncio.Queue()
+        self._reply_consumer_task: asyncio.Task | None = None
+
+        # 会话 id → 唤醒词名：post_api_request 载荷里只有 session_id，靠它定位 agent
+        self._session_to_name: dict[str, str] = {}
 
         # 待汇报队列：agent 完成但当前有其他 agent 活跃时排队
         # 元素: (keyword, segments, gen)；segments 为 [(emotion, text), ...]
@@ -167,10 +182,9 @@ class VoiceApp:
             self.tts_engine.on_audio_chunk = self.audio_player.feed
 
         # 4. 注册所有工具（在 agent 创建之前，确保工具可用）
-        self._register_speak_tool()
         register_mpd_tools()
 
-        # ─── 系统提示词（语音助手通用规则 + speak 工具 + 播放控制规则）─
+        # ─── 系统提示词（语音助手通用规则 + 自动播报 + 播放控制规则）─
         speak_prompt = (
             '\n\n【语音助手通用规则】\n'
             '你是一个语音助手。\n'
@@ -192,9 +206,10 @@ class VoiceApp:
             '不需要复述说话人。\n'
             '\n'
             '【语音播报规则】\n'
-            '你拥有 speak 工具，可以通过语音播报与用户实时交流。\n'
-            '- 阶段性计划或过程信息（如「正在搜索网络」）→ 并行调用 speak(text="...") 来播报\n'
-            '- 不要在 speak 工具中输出最终回答。最终回答请直接以文字格式回复，格式为：(情绪)你要说的话\n'
+            '你的每条文字回复都会被系统实时语音播报给用户（无需调用任何播报工具）。\n'
+            '- 工具调用过程中的阶段性说明（如「正在搜索网络」）请直接作为文字回复输出，\n'
+            '  系统会立即播报；不需要文字说明的纯工具调用轮次可以只返回工具调用。\n'
+            '- 最终回答请直接以文字格式回复，格式为：(情绪)你要说的话\n'
             '  例如：(happy)你好，有什么可以帮助你的？\n'
             '  情绪可选值：neutral(中性) sad(悲伤) happy(高兴) angry(生气) fear(恐惧) '
             'story(故事) poetry(诗歌) sajiao(撒娇) disgusted(厌恶) amaze(震惊) exciting(兴奋) '
@@ -204,7 +219,7 @@ class VoiceApp:
             '【播放控制工具规则】\n'
             '你拥有 mpd_ 系列工具用于控制音乐播放（如 mpd_play、mpd_pause、mpd_stop、\n'
             'mpd_previous、mpd_next 等）。\n'
-            '- 当你使用播放控制工具时，执行的同时允许并行调用 speak 工具，播放控制工具执行后直接返回 [FINISH] 作为文字回复，\n'
+            '- 当你使用播放控制工具时，播放控制工具执行后直接返回 [FINISH] 作为文字回复，\n'
             '  该条文字回复不要使用 (情绪)格式。\n'
             '- [FINISH] 表示操作已完成，系统会自动关闭对话窗口，\n'
             '  用户可以通过再次说唤醒词来继续对话。'
@@ -231,6 +246,7 @@ class VoiceApp:
             )
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
             self._agents[name] = (agent, executor, None, 0)  # (agent, executor, history, generation)
+            self._session_to_name[agent.session_id] = name
             logger.info("Agent [%s]: model=%s, provider=%s, api_mode=%s, session=%s",
                         name, ac.get("model"), agent.provider,
                         agent.api_mode, ac.get("session_id"))
@@ -273,8 +289,12 @@ class VoiceApp:
         self.frontend = VoiceFrontend(frontend_config, self.asr_engine)
         self.frontend.start()
 
-        # 7. 启动 speak 队列消费者
-        self._speak_consumer_task = asyncio.create_task(self._speak_queue_consumer())
+        # 7. 启动 LLM 回复播放队列消费者
+        self._reply_consumer_task = asyncio.create_task(self._reply_queue_consumer())
+
+        # 8. 注册播报桥接收方：speech-relay 插件回调把 LLM 回复转交到这里
+        from .speech_bridge import set_sink
+        set_sink(self._on_llm_reply_hook)
 
         self._running = True
         logger.info("=" * 50)
@@ -288,14 +308,18 @@ class VoiceApp:
     async def stop(self):
         self._running = False
 
-        # 取消 speak 队列消费者
-        if self._speak_consumer_task:
-            self._speak_consumer_task.cancel()
+        # 注销播报桥接收方
+        from .speech_bridge import clear_sink
+        clear_sink()
+
+        # 取消 LLM 回复播放队列消费者
+        if self._reply_consumer_task:
+            self._reply_consumer_task.cancel()
             try:
-                await self._speak_consumer_task
+                await self._reply_consumer_task
             except asyncio.CancelledError:
                 pass
-            self._speak_consumer_task = None
+            self._reply_consumer_task = None
 
         if self.frontend:
             self.frontend.stop()
@@ -305,74 +329,34 @@ class VoiceApp:
             executor.shutdown(wait=False)
         logger.info("Voice frontend stopped")
 
-    # ─── speak 工具注册 ──────────────────────────────────
+    # ─── LLM 回复播放队列消费者 ──────────────────────────
 
-    def _register_speak_tool(self):
-        """注册 speak 工具，供 AI Agent 调用进行语音播报。"""
-        SPEAK_SCHEMA = {
-            "name": "speak",
-            "description": "用语音播报阶段性进展/过程信息给用户听。"
-                           "注意：最终回答不要使用此工具，请直接以 (情绪)文字 格式返回文字回复。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "要语音播报的文本内容"
-                    },
-                    "emotion": {
-                        "type": "string",
-                        "enum": [
-                            "neutral", "sad", "happy", "angry", "fear",
-                            "story", "poetry", "sajiao", "disgusted", "amaze",
-                            "exciting", "aojiao", "jieshuo"
-                        ],
-                        "description": "语音情绪/风格。"
-                                       "neutral(中性) sad(悲伤) happy(高兴) angry(生气) fear(恐惧) "
-                                       "story(故事) poetry(诗歌) sajiao(撒娇) disgusted(厌恶) "
-                                       "amaze(震惊) exciting(兴奋) aojiao(傲娇) jieshuo(解说)"
-                    }
-                },
-                "required": ["text"]
-            }
-        }
-
-        def _speak_handler(args, **kw):
-            text = args.get("text", "")
-            emotion = args.get("emotion", "")
-            if not text.strip():
-                return "empty text"
-            # speak 工具仅用于阶段性汇报
-            asyncio.run_coroutine_threadsafe(
-                self._speak_queue.put((text, emotion)),
-                self._loop,
-            )
-            return f"speak queued: {text[:40]}..."
-
-        registry.register(
-            name="speak",
-            toolset="voice_agent",
-            schema=SPEAK_SCHEMA,
-            handler=_speak_handler,
-        )
-        logger.info("speak tool registered")
-
-    # ─── speak 队列消费者 ────────────────────────────────
-
-    async def _speak_queue_consumer(self):
+    async def _reply_queue_consumer(self):
         """
-        后台消费 speak 队列，逐条进行阶段性汇报的 TTS 播报。
+        后台消费 LLM 回复播放队列：
+        - 中间轮（is_final=False）：逐段阶段性播报（不播通知音，不进对话窗口）
+        - 最终轮（is_final=True）：整段流式播放，播完播通知音并进入对话窗口
+        播放前做代际校验，期间被打断（gen 已递增）的回复直接丢弃。
         """
         try:
             while True:
-                text, emotion = await self._speak_queue.get()
-                await self._speak_raw(text, emotion=emotion)
+                name, gen, segments, is_final = await self._reply_queue.get()
+                _, _, _, current_gen = self._agents.get(name, (None, None, None, -1))
+                if gen != current_gen:
+                    logger.info(f"🚫 Reply [{name}] gen {gen} != current {current_gen}, discard")
+                    continue
+                if is_final:
+                    await self._speak_response(segments)
+                else:
+                    for emotion, text in segments:
+                        if text and text.strip():
+                            await self._speak_raw(text, emotion=emotion)
         except asyncio.CancelledError:
-            logger.info("Speak consumer cancelled")
+            logger.info("Reply consumer cancelled")
 
     async def _speak_raw(self, text: str, emotion: str = ""):
         """
-        纯 TTS 合成播放（阶段性汇报使用，不播通知音，不进对话窗口）。
+        纯 TTS 合成播放（阶段性汇报 / 中间轮回复使用，不播通知音，不进对话窗口）。
 
         Args:
             text: 要播报的文本
@@ -458,7 +442,8 @@ class VoiceApp:
                     logger.info(f"⏹ [{name}] Interrupted response, skip")
                     return
 
-                # 播放控制类工具执行后的回复标记 [FINISH]，跳过 TTS 并关闭对话窗口
+                # 播放控制类工具执行后的回复标记 [FINISH]：回调路径（_on_llm_reply_hook）
+                # 已处理并关闭对话窗口，这里兜底一次（钩子异常未触发时）
                 if response.upper().strip("[]") == "FINISH":
                     logger.info(f"✅ [{name}] FINISH signal, close conversation window")
                     if name == self._active_name and self.frontend:
@@ -467,21 +452,12 @@ class VoiceApp:
                         )
                     return
 
-                # 解析 (情绪)文字内容 格式（支持多个情绪标记分段）
+                # 语音播报（含情绪分段解析、通知音、对话窗口）由 post_api_request
+                # 回调完成：speech-relay 插件 → 播报桥 → _on_llm_reply_hook →
+                # 播放队列。这里只保留日志与空回复兜底，不再重复播放。
                 segments = self._parse_emotion_segments(response)
-                logger.info(f"(gen={gen}) [{name}] Parsed: "
-                            f"{len(segments)} 段, 首段={segments[0][1][:30] if segments else ''}")
-                if not segments:
-                    logger.info(f"✅ [{name}] Empty response after parse, skip")
-                    return
-
-                if name == self._active_name:
-                    asyncio.run_coroutine_threadsafe(
-                        self._speak_response(segments), self._loop
-                    )
-                else:
-                    self._pending.append((name, segments, gen))
-                    logger.info(f"📥 [{name}] queued (pending={len(self._pending)})")
+                logger.info(f"(gen={gen}) [{name}] Final response: {len(segments)} 段, "
+                            f"{segments[0][1][:40] if segments else '(空)'}...")
             except Exception as e:
                 logger.error(f"Agent [{name}] chat error: {e}")
             finally:
@@ -494,41 +470,61 @@ class VoiceApp:
         self._start_wait_tone()
         executor.submit(_chat)
 
-    async def _speak(self, text: str):
-        """TTS 合成并播放（完整流程，含通知音和对话窗口）。代际检查由调用方负责。"""
-        if not text.strip() or not self.tts_engine:
-            return
+    # ─── LLM 回复钩子（post_api_request 回调）────────────
 
-        logger.info(f"🔊 TTS: {text[:60]}...")
-        self._stop_wait_tone()  # TTS 播放前停止提示音
-        # TTS 播放前强制暂停音乐（即使 agent 执行期间用户恢复了播放）
-        player_pause(force=True)
+    def _on_llm_reply_hook(self, payload: dict):
+        """
+        播报桥接收方：speech-relay 插件把每次 API 调用后的回复载荷转交到这里。
+
+        运行在 hermes agent 的调用线程（同步）。职责：
+        - 通过 session_id 定位唤醒词名；
+        - 解析 (情绪)文字 分段，投递到播放队列；
+        - finish_reason=stop 视为最终回复（is_final=True，播完进对话窗口）；
+        - [FINISH]（播放控制工具结束标记）不播报，直接关闭对话窗口；
+        - 当前已被其他唤醒词取代时，最终回复进入待汇报队列排队递送。
+        """
         try:
-            if self.frontend:
-                self.frontend.set_tts_playing(True)
-            self.tts_engine.start()
-            self.tts_engine.synthesize(text)
-            self.tts_engine.complete()
-            self.tts_engine.wait(timeout=15)
-            if self.audio_player:
-                self.audio_player.wait_for_drain(timeout=15.0)
-                import time as _t
-                _t.sleep(0.15)
-            self._play_asset("notification")
-            if self.audio_player:
-                self.audio_player.wait_for_drain(timeout=5.0)
-                _t.sleep(0.05)
-            if self.frontend:
-                self.frontend.enter_conversation_window()
+            session_id = payload.get("session_id") or ""
+            name = self._session_to_name.get(session_id)
+            if not name or name not in self._agents:
+                return
+            finish_reason = payload.get("finish_reason") or ""
+            assistant = payload.get("assistant_message")
+            if isinstance(assistant, dict):
+                content = assistant.get("content") or ""
+            else:
+                content = getattr(assistant, "content", None) or ""
+            text = content.strip()
+            if not text:
+                return
+
+            # 播放控制类工具结束标记 [FINISH]：不播报，关闭对话窗口
+            if text.upper().strip("[]") == "FINISH":
+                logger.info(f"✅ [{name}] FINISH signal (hook), close conversation window")
+                if name == self._active_name and self.frontend:
+                    asyncio.run_coroutine_threadsafe(
+                        self._close_conversation(), self._loop
+                    )
+                return
+
+            # 代际：回调时刻的当前 gen，播放前消费者还会再校验一次
+            _, _, _, gen = self._agents.get(name, (None, None, None, 0))
+            segments = self._parse_emotion_segments(text)
+            if not segments:
+                return
+            is_final = finish_reason == "stop"
+            if name == self._active_name:
+                asyncio.run_coroutine_threadsafe(
+                    self._reply_queue.put((name, gen, segments, is_final)),
+                    self._loop,
+                )
+            elif is_final:
+                # 已被其他唤醒词取代：最终回复进入待汇报队列，等对话窗口过期后递送
+                self._pending.append((name, segments, gen))
+                logger.info(f"📥 [{name}] queued (pending={len(self._pending)})")
+            # 非最终轮且已不活跃：对话被打断，丢弃
         except Exception as e:
-            logger.warning(f"TTS error: {e}")
-        finally:
-            if self.frontend:
-                self.frontend.set_tts_playing(False)
-            # TTS 播放完毕（含异常情况）恢复音乐
-            player_resume()
-        # TTS 播放完毕后尝试递送队列中的待汇报结果
-        self._deliver_pending()
+            logger.error(f"LLM reply hook error: {e}")
 
     def _deliver_pending(self):
         """
@@ -563,7 +559,7 @@ class VoiceApp:
 
     # ─── 情绪解析工具 ────────────────────────────────────
 
-    # 合法情绪集合（与 speak 工具 schema、TTS 引擎保持一致）
+    # 合法情绪集合（与 TTS 引擎保持一致）
     VALID_EMOTIONS = {
         "neutral", "sad", "happy", "angry", "fear",
         "story", "poetry", "sajiao", "disgusted", "amaze",
@@ -799,7 +795,7 @@ class VoiceApp:
     def _on_wake_word(self, name: str):
         """
         唤醒词命中：区分两种情况——
-        1. 唤醒的是当前活跃 agent（同人）→ 完全打断（agent + TTS + speak队列）
+        1. 唤醒的是当前活跃 agent（同人）→ 完全打断（agent + TTS + 回复播放队列）
         2. 唤醒的是其他 agent（切换）→ 仅打断 TTS 播放，保留原 agent 继续处理
         """
         old_active = self._active_name
@@ -829,13 +825,13 @@ class VoiceApp:
                     agent.interrupt()
                 except Exception as e:
                     logger.debug(f"Agent interrupt: {e}")
-            # 清空 speak 队列中尚未播放的消息
-            while not self._speak_queue.empty():
+            # 清空 LLM 回复播放队列中尚未播放的消息
+            while not self._reply_queue.empty():
                 try:
-                    self._speak_queue.get_nowait()
+                    self._reply_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-            logger.info("🗑️ Cleared speak queue for same-agent interrupt")
+            logger.info("🗑️ Cleared reply queue for same-agent interrupt")
         else:
             # 切换 agent：仅打断 TTS/音频，不干涉原 agent 逻辑
             if old_active:
