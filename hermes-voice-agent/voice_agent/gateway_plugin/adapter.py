@@ -53,6 +53,16 @@ logger = logging.getLogger(__name__)
 # 语音会话 chat_id 前缀：唤醒词 <名> → chat_id "wake:<名>"
 WAKE_CHAT_PREFIX = "wake:"
 
+# gateway 系统通知内容特征：voice 频道只播 LLM 回复，命中以下前缀的通知静默。
+# - "📬 No home channel is set"：home-channel 提示（首次对话且未配置 home channel）
+# - "♻️"/"♻"：Gateway online / restarted 生命周期广播（另有
+#   platforms.voice.gateway_restart_notification=false 配置层抑制，此处双保险）
+_SYSTEM_NOTICE_PREFIXES = (
+    "📬 No home channel is set",
+    "♻️",
+    "♻",
+)
+
 # 项目根（voice_agent/gateway_plugin/ → 项目根）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 NOTIFICATION_PATH = PROJECT_ROOT / "assets" / "notification.wav"
@@ -314,6 +324,12 @@ class VoiceAdapter(BasePlatformAdapter):
         text = (content or "").strip()
         if not text or self._playback_queue is None:
             return SendResult(success=False, error="播报队列未就绪")
+
+        # voice 频道只播 LLM 回复：gateway 系统通知（home-channel 提示、
+        # online/restart 广播等）静默，不进入播报队列
+        if text.startswith(_SYSTEM_NOTICE_PREFIXES):
+            logger.info("[voice] 系统通知已静默: %s", text[:60])
+            return SendResult(success=True)
 
         if text.upper().strip("[]") == "FINISH":
             logger.info("[voice] [FINISH] 关闭对话窗口")
