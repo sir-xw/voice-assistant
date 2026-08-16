@@ -163,6 +163,8 @@ class VoiceAdapter(BasePlatformAdapter):
         # 播报串行队列（阶段 2）：所有会话回复 + 中间轮钩子共用，单消费者
         self._playback_queue: Optional[asyncio.Queue] = None
         self._playback_task: Optional[asyncio.Task] = None
+        # 钩子最近播报的最终回复（chat_id → 文本）：send() 去重用
+        self._last_final_by_chat: Dict[str, str] = {}
 
     # ─── 配置解析 ────────────────────────────────────────
 
@@ -308,6 +310,24 @@ class VoiceAdapter(BasePlatformAdapter):
 
     # ─── outbound：gateway 回复 → 播报 ───────────────────
 
+    def _with_identity_prefix(self, wake: str, segments: List[tuple[str, str]]):
+        """身份前缀（可选）：多唤醒词共用扬声器时区分谁在说话。"""
+        if self._identity_prefix and wake and segments:
+            emo, first = segments[0]
+            segments[0] = (emo, f"我是{wake}，{first}")
+        return segments
+
+    def _enqueue_playback(
+        self, wake: str, segments: List[tuple[str, str]], is_final: bool
+    ) -> None:
+        """线程安全地把一条播报投进串行播放队列（钩子/兜底路径共用）。"""
+        if self._loop is None or self._playback_queue is None:
+            return
+        segs = self._with_identity_prefix(wake, list(segments))
+        asyncio.run_coroutine_threadsafe(
+            self._playback_queue.put((wake, segs, is_final)), self._loop
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -315,20 +335,17 @@ class VoiceAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """把 agent 回复播报给用户。
+        """gateway 转发入口。
 
-        解析 (情绪)文字 分段 → 投入全局播报队列（串行）→ TTS 流式播放 →
-        通知音 → 进入对话窗口期。播放由后台消费者执行，send 快速返回。
-        [FINISH]（播放控制工具结束标记）不播报，直接关闭对话窗口。
+        **LLM 回复的播报主通道是 post_api_request 钩子**（钩子只拿得到真实
+        API 回复，系统通知不触发钩子，天然排除）。send() 只处理：
+        1. [FINISH]（播放控制结束标记）→ 关闭对话窗口；
+        2. 钩子已播报的最终回复 → 去重跳过；
+        3. 系统通知（home-channel 提示 / 生命周期广播）→ 静默；
+        4. 其余内容（钩子漏触发或回复被改写等异常路径）→ 兜底播报。
         """
         text = (content or "").strip()
-        if not text or self._playback_queue is None:
-            return SendResult(success=False, error="播报队列未就绪")
-
-        # voice 频道只播 LLM 回复：gateway 系统通知（home-channel 提示、
-        # online/restart 广播等）静默，不进入播报队列
-        if text.startswith(_SYSTEM_NOTICE_PREFIXES):
-            logger.info("[voice] 系统通知已静默: %s", text[:60])
+        if not text:
             return SendResult(success=True)
 
         if text.upper().strip("[]") == "FINISH":
@@ -336,17 +353,27 @@ class VoiceAdapter(BasePlatformAdapter):
             self._close_conversation_window()
             return SendResult(success=True)
 
+        wake = chat_id[len(WAKE_CHAT_PREFIX):] \
+            if chat_id.startswith(WAKE_CHAT_PREFIX) else chat_id
+
+        # 钩子已播报过这个最终回复 → 去重，避免重复播放
+        if self._last_final_by_chat.get(chat_id) == text:
+            logger.info("[voice] send 去重：最终回复已由钩子播报，跳过")
+            return SendResult(success=True)
+
+        # 系统通知（home-channel 提示 / online-restart 广播）→ 静默
+        if text.startswith(_SYSTEM_NOTICE_PREFIXES):
+            logger.info("[voice] 系统通知已静默: %s", text[:60])
+            return SendResult(success=True)
+
+        # 兜底：钩子未播报的内容（异常路径）按最终回复播报
+        if self._playback_queue is None:
+            return SendResult(success=False, error="播报队列未就绪")
         segments = parse_emotion_segments(text)
         if not segments:
             return SendResult(success=True)
-
-        wake = chat_id[len(WAKE_CHAT_PREFIX):] \
-            if chat_id.startswith(WAKE_CHAT_PREFIX) else chat_id
-        if self._identity_prefix and wake:
-            emo, first = segments[0]
-            segments[0] = (emo, f"我是{wake}，{first}")
-        await self._playback_queue.put((wake, segments, True))
-        logger.info("[voice] send → %s: %s", wake, text[:60])
+        self._enqueue_playback(wake, segments, True)
+        logger.info("[voice] send 兜底播报 → %s: %s", wake, text[:60])
         return SendResult(success=True)
 
     async def _playback_consumer(self) -> None:
@@ -569,12 +596,16 @@ def is_connected() -> bool:
 
 
 def on_post_api_request(**kwargs):
-    """post_api_request 钩子：中间轮文字回复直接播报（替代已废除的 speak 工具）。
+    """post_api_request 钩子：**LLM 回复的唯一播报主通道**。
 
-    - finish_reason == "tool_calls" 且 assistant_message.content 非空
-      → 阶段文本 → 语音播报队列（无通知音、不进对话窗口）
-    - finish_reason == "stop" → 忽略（最终回复由 gateway send() 播放，天然去重）
-    - content == "[FINISH]" → 关闭对话窗口（不播报）
+    - finish_reason == "stop"：最终回复 → 播报（is_final=True，播完通知音
+      + 进对话窗口），并记录去重（send() 收到同一文本时跳过）
+    - finish_reason == "tool_calls" 且 assistant_message.content 非空：
+      中间轮阶段文本 → 播报（is_final=False，无通知音、不进对话窗口）
+    - content == "[FINISH]"：关闭对话窗口（不播报）
+
+    系统通知（home-channel 提示、生命周期广播）不经过 agent API，不会触发
+    本钩子，因此天然不会被播报——无需内容过滤即可保证"voice 只播 LLM 回复"。
     """
     adapter = _get_active_instance()
     if adapter is None:
@@ -592,18 +623,18 @@ def on_post_api_request(**kwargs):
         if text.upper().strip("[]") == "FINISH":
             adapter._close_conversation_window()
             return
-        if finish_reason == "stop":
-            return  # 最终回复由 send() 播放
+
+        wake = adapter._current_wake or ""
+        is_final = finish_reason == "stop"
         segments = parse_emotion_segments(text)
         if not segments:
             return
-        wake = adapter._current_wake or ""
-        loop = adapter._loop
-        if loop is not None and adapter._playback_queue is not None:
-            asyncio.run_coroutine_threadsafe(
-                adapter._playback_queue.put((wake, segments, False)), loop
-            )
-            logger.info("[voice] 中间轮播报: %s", text[:60])
+        if is_final:
+            # 记录去重：send() 收到同一最终回复文本时跳过
+            adapter._last_final_by_chat[adapter.wake_chat_id(wake)] = text
+        adapter._enqueue_playback(wake, segments, is_final)
+        logger.info("[voice] 钩子播报(%s): %s",
+                    "最终" if is_final else "中间", text[:60])
     except Exception as exc:
         logger.warning("[voice] post_api_request 钩子异常: %s", exc)
 
