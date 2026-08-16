@@ -286,9 +286,9 @@ class VoiceAdapter(BasePlatformAdapter):
             wake_word_keyword=self._first_trigger_keyword()
             or wake.get("keyword", "赫尔墨斯"),
             wake_word_threshold=float(kws.get("threshold", wake.get("sensitivity", 0.25))),
-            # 模型目录统一走 voice-agent.yaml 的 kws.model_dir（绝对路径），
-            # 不依赖插件源码目录
-            kws_model_dir=str(resolve_kws_model_dir(vcfg)),
+            # 模型目录统一走 profile 约定：VoiceFrontend 内部会再拼
+            # kws_model_name，因此这里传"类别目录"（.../models/sherpa-kws）
+            kws_model_dir=str(resolve_kws_model_dir(vcfg).parent),
             kws_model_name=kws.get("model_name",
                                    "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"),
             kws_encoder=kws.get("encoder", "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx"),
