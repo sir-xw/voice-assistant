@@ -11,3 +11,8 @@ requires-python = ">=3.10"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["voice_agent*"]
+
+# hermes 插件入口：pip 安装本包即注册 voice-platform 语音平台插件
+# 注意：entry point 指向模块（hermes 用 ep.load() 拿模块后取 register 函数）
+[project.entry-points."hermes_agent.plugins"]
+voice-platform = "voice_agent.gateway_plugin"
