@@ -119,6 +119,14 @@ class VoiceAdapter(BasePlatformAdapter):
     # 播放是异步后台任务，支持 turn 结束后的异步递送
     supports_async_delivery: bool = True
 
+    # 语音输入来自本地物理麦克风（sounddevice），不是网络暴露的账号消息——
+    # 能物理接触到设备的人即视为已授权（等同 HOMEASSISTANT/WEBHOOK 语义）。
+    # 因此授权由"本地物理访问"这一可信上游完成，无需平台用户白名单；
+    # 如需严格白名单，可另行配置 VOICE_ALLOWED_USERS env（见 register()）。
+    @property
+    def authorization_is_upstream(self) -> bool:
+        return True
+
     def __init__(self, config: PlatformConfig):
         platform = Platform("voice")
         super().__init__(config=config, platform=platform)
@@ -608,6 +616,11 @@ def register(ctx) -> None:
         required_env=["VOICE_SecretId", "VOICE_SecretKey", "VOICE_AppId"],
         install_hint="pip install -e .  # hermes-voice-agent",
         is_connected=is_connected,
+        # 语音是本地物理麦克风输入，无网络暴露——授权由这两个 env 控制：
+        #   VOICE_ALLOW_ALL_USERS=true           信任所有说话人（推荐）
+        #   VOICE_ALLOWED_USERS=voice-user,...   或显式白名单
+        allowed_users_env="VOICE_ALLOWED_USERS",
+        allow_all_env="VOICE_ALLOW_ALL_USERS",
         emoji="🎙️",
         platform_hint=(
             "你通过语音与用户交流：回复要简洁（3 句话以内），最终回答用 "
