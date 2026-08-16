@@ -180,9 +180,8 @@ class VoiceAdapter(BasePlatformAdapter):
         """
         self._loop = asyncio.get_running_loop()
         try:
-            ok, reason = check_requirements()
-            if not ok:
-                logger.warning("[voice] 前置检查未通过: %s", reason)
+            if not check_requirements():
+                logger.warning("[voice] 前置检查未通过，连接失败")
                 return False
 
             vcfg = self._resolve_voice_cfg()
@@ -499,29 +498,43 @@ class VoiceAdapter(BasePlatformAdapter):
 # ─── 前置检查 / 配置校验 ─────────────────────────────────
 
 
-def check_requirements() -> tuple[bool, str]:
-    """校验腾讯云凭据与 sherpa 模型目录是否存在。"""
+def check_requirements() -> bool:
+    """前置检查（check_fn 契约：返回 bool）。
+
+    校验腾讯云凭据与 sherpa 模型目录是否存在；缺失时记录日志并返回 False。
+    """
     missing = [k for k in ("VOICE_SecretId", "VOICE_SecretKey", "VOICE_AppId")
                if not os.getenv(k)]
     if missing:
-        return False, f"缺少腾讯云凭据: {', '.join(missing)}"
-    # sherpa 模型路径（默认项目 models/ 下）——存在性校验
-    from pathlib import Path
-    project_root = Path(__file__).resolve().parent.parent.parent
-    model_dir = project_root / "models" / "sherpa-kws"
+        logger.warning("[voice] 缺少腾讯云凭据: %s", ", ".join(missing))
+        return False
+    model_dir = PROJECT_ROOT / "models" / "sherpa-kws"
     if not model_dir.is_dir():
-        return False, f"sherpa 模型目录不存在: {model_dir}"
-    return True, ""
+        logger.warning("[voice] sherpa 模型目录不存在: %s", model_dir)
+        return False
+    return True
 
 
-def validate_config(config) -> List[str]:
-    """返回配置问题列表（空 = 无问题）。"""
-    problems: List[str] = []
-    extra = (config or {}).get("extra") or {}
-    wakewords = extra.get("wakewords") or {}
-    if not wakewords:
-        problems.append("platforms.voice.extra.wakewords 未配置任何唤醒词")
-    return problems
+def validate_config(config) -> bool:
+    """校验语音平台配置（契约：接收 PlatformConfig 或 dict，返回 bool）。
+
+    True = 可启动；False = 缺少必要配置（如未配置任何唤醒词）。
+    """
+    try:
+        if isinstance(config, dict):
+            extra = config.get("extra") or {}
+        elif config is not None:
+            extra = getattr(config, "extra", None) or {}
+        else:
+            extra = {}
+        wakewords = extra.get("wakewords") or {}
+        if not wakewords:
+            logger.warning("[voice] platforms.voice.extra.wakewords 未配置任何唤醒词")
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("[voice] validate_config 异常: %s", exc)
+        return False
 
 
 def is_connected() -> bool:
