@@ -318,12 +318,22 @@ class VoiceAdapter(BasePlatformAdapter):
         return segments
 
     def _enqueue_playback(
-        self, wake: str, segments: List[tuple[str, str]], is_final: bool
+        self,
+        wake: str,
+        segments: List[tuple[str, str]],
+        is_final: bool,
+        with_prefix: bool = False,
     ) -> None:
-        """线程安全地把一条播报投进串行播放队列（钩子/兜底路径共用）。"""
+        """线程安全地把一条播报投进串行播放队列（钩子/兜底路径共用）。
+
+        with_prefix：仅 send 兜底路径（跨会话/异常内容）需要身份前缀；
+        钩子播报的 LLM 回复必然是当前对话，不加前缀。
+        """
         if self._loop is None or self._playback_queue is None:
             return
-        segs = self._with_identity_prefix(wake, list(segments))
+        segs = list(segments)
+        if with_prefix:
+            segs = self._with_identity_prefix(wake, segs)
         asyncio.run_coroutine_threadsafe(
             self._playback_queue.put((wake, segs, is_final)), self._loop
         )
@@ -366,13 +376,13 @@ class VoiceAdapter(BasePlatformAdapter):
             logger.info("[voice] 系统通知已静默: %s", text[:60])
             return SendResult(success=True)
 
-        # 兜底：钩子未播报的内容（异常路径）按最终回复播报
+        # 兜底：钩子未播报的内容（异常路径）按最终回复播报，带身份前缀
         if self._playback_queue is None:
             return SendResult(success=False, error="播报队列未就绪")
         segments = parse_emotion_segments(text)
         if not segments:
             return SendResult(success=True)
-        self._enqueue_playback(wake, segments, True)
+        self._enqueue_playback(wake, segments, True, with_prefix=True)
         logger.info("[voice] send 兜底播报 → %s: %s", wake, text[:60])
         return SendResult(success=True)
 
