@@ -206,6 +206,9 @@ class VoiceAdapter(BasePlatformAdapter):
 
         inbound 链路：sherpa 唤醒词命中 → VAD 确认人声 → 腾讯云 ASR →
         on_complete（last_text）→ MessageEvent → gateway 会话。
+
+        硬件初始化（麦克风/播放器）为同步调用，放入线程池执行，避免阻塞
+        gateway 事件循环（否则 Ctrl+C 优雅关闭无法推进）。
         """
         self._loop = asyncio.get_running_loop()
         try:
@@ -218,13 +221,37 @@ class VoiceAdapter(BasePlatformAdapter):
             self._init_frontend(vcfg)
             self._init_playback(vcfg)
             _set_active_instance(self)
-            self._frontend.start()
+            # sounddevice 打开麦克风可能在无音频服务器时阻塞/耗时，
+            # 放入线程池，避免卡住 gateway 事件循环
+            await asyncio.to_thread(self._frontend.start)
             logger.info("[voice] 语音平台已连接（唤醒词: %s）",
                         ", ".join(self._wakewords) or "(未配置)")
             return True
         except Exception as exc:
             logger.error("[voice] connect 失败: %s", exc)
+            await self._cleanup_partial()
             return False
+
+    async def _cleanup_partial(self) -> None:
+        """清理已创建的资源（connect 失败或 disconnect 时调用，幂等）。"""
+        _set_active_instance(None)
+        if self._frontend:
+            try:
+                self._frontend.stop()
+            except Exception:
+                pass
+        if self._playback_task:
+            self._playback_task.cancel()
+            try:
+                await self._playback_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._playback_task = None
+        if self._player:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
 
     def _init_playback(self, vcfg: Dict[str, Any]) -> None:
         """装配腾讯云 TTS + 音频播放器，启动播报串行队列。"""
@@ -301,7 +328,10 @@ class VoiceAdapter(BasePlatformAdapter):
             vad_speech_confirm_frames=int(vad.get("speech_confirm_frames", 3)),
             wake_guard_sec=float(vad.get("wake_guard_sec", 2.5)),
             mic_sample_rate=int(mic.get("sample_rate", 0)),
-            mic_device=mic.get("device"),
+            # "auto"/空 → None（sounddevice 自动选择设备）；否则按设备名/索引
+            mic_device=None
+            if str(mic.get("device") or "").lower() in ("", "auto")
+            else mic.get("device"),
             conversation_window_sec=self._conversation_window_sec,
             on_wake_word=self._on_wake_word,
             on_interrupt_request=self._on_interrupt_request,
@@ -333,19 +363,12 @@ class VoiceAdapter(BasePlatformAdapter):
             logger.warning("[voice] 唤醒提示音播放失败: %s", exc)
 
     async def disconnect(self) -> None:
-        """停止语音组件与监听。"""
-        _set_active_instance(None)
-        if self._frontend:
-            try:
-                self._frontend.stop()
-            except Exception as exc:
-                logger.debug("[voice] frontend stop: %s", exc)
-        if self._playback_task:
-            self._playback_task.cancel()
-            self._playback_task = None
-        if self._player:
-            self._player.stop()
-        logger.info("[voice] 语音平台已断开")
+        """停止语音组件与监听（幂等，快速返回）。"""
+        try:
+            await self._cleanup_partial()
+            logger.info("[voice] 语音平台已断开")
+        except Exception as exc:
+            logger.warning("[voice] disconnect 异常: %s", exc)
 
     # ─── outbound：gateway 回复 → 播报 ───────────────────
 
