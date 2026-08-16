@@ -12,13 +12,51 @@ pip install -e /path/to/hermes-voice-agent
 # 2. 启用插件（写入 ~/.hermes/config.yaml 的 plugins.enabled）
 hermes plugins enable voice-platform
 
-# 3. 配置腾讯云凭据（写入 ~/.hermes/.env 或环境变量）
+# 3. 配置腾讯云凭据（写入 profile 的 ~/.hermes/.env）
 #    VOICE_SecretId / VOICE_SecretKey / VOICE_AppId
 ```
 
 ## 配置
 
-`~/.hermes/config.yaml`：
+插件配置**全部归 profile 目录**（hermes home，默认 `~/.hermes/`），不读取插件安装位置的任何文件：
+
+- **语音参数**（kws/vad/mic/asr/tts/voiceprint）：`~/.hermes/voice-agent.yaml`（约定文件，结构见下）
+- **平台开关/唤醒词/每会话提示词**：`~/.hermes/config.yaml` 的 `platforms.voice`
+- **腾讯云凭据**：`~/.hermes/.env`（适配器自动加载，不 fallback 源码目录）
+- 优先级：`platforms.voice.extra` > `voice-agent.yaml` > 内置默认
+
+### 1) `~/.hermes/voice-agent.yaml`（语音参数，全部可省略 = 内置默认）
+
+```yaml
+wake_word:
+  enabled: true
+
+# sherpa KWS 模型（绝对路径；相对路径基于 profile 目录解析）
+kws:
+  model_dir: "/path/to/models/sherpa-kws"
+  model_name: "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+
+# VAD（wake_guard_sec 唤醒后静音保护期，太短会导致 ASR 提前结束）
+vad:
+  mode: 3
+  silence_threshold_ms: 1000
+  wake_guard_sec: 5.0
+
+mic:
+  sample_rate: 0        # 0=自动探测
+  device: auto
+
+asr:
+  engine_model: "16k_zh_en_speaker_2.0"
+
+tts:
+  voice_type: 601009
+
+voiceprint:
+  enabled: false
+```
+
+### 2) `~/.hermes/config.yaml`（平台开关与每会话配置）
 
 ```yaml
 plugins:
@@ -27,29 +65,16 @@ plugins:
 platforms:
   voice:
     enabled: true
+    gateway_restart_notification: false   # voice 只播 LLM 回复，抑制系统广播
     extra:
       # 唤醒词 → 会话映射（每个唤醒词 = 独立 gateway 会话，chat_id = "wake:<名>"）
       wakewords:
-        小布: { session_id: "hermes-voice-小布" }
-        翻译助手: { session_id: "hermes-voice-翻译助手" }
+        小布: {}
+        翻译助手: {}
       # 连续对话窗口期（最终回复播完后 VAD 直接听，无需再喊唤醒词）
       conversation_window_sec: 5.0
-      # 播报身份前缀：多唤醒词共用扬声器时加 "我是{唤醒词}，"
+      # 身份前缀：仅 send 兜底路径（多唤醒词并发）使用，LLM 回复不加
       identity_prefix: true
-      # sherpa KWS 模型（默认项目 models/ 下，可改）
-      kws:
-        model_dir: "models/sherpa-kws"
-        model_name: "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
-      # VAD（可选，默认与 VoiceApp 一致）
-      vad:
-        mode: 3
-        silence_threshold_ms: 600
-      # TTS 音色（可选，默认 101001）
-      tts:
-        voice_type: 101001
-      # 说话人识别（可选，复用 voice_agent/voiceprint.py）
-      voiceprint:
-        enabled: false
 
     # 每个唤醒词独立的 system_prompt / model / provider（gateway 原生机制）
     channel_overrides:
@@ -87,7 +112,8 @@ Type=simple
 User=root
 WorkingDirectory=/root/git/voice-assistant/hermes-voice-agent
 Environment=HERMES_ENABLE_PROJECT_PLUGINS=1
-EnvironmentFile=/root/git/voice-assistant/hermes-voice-agent/.env
+# 凭据在 profile 目录 ~/.hermes/.env（插件自动加载），无需项目 .env
+EnvironmentFile=/root/.hermes/.env
 ExecStart=/usr/local/lib/hermes-agent/venv/bin/hermes gateway
 Restart=always
 
