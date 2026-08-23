@@ -85,8 +85,6 @@ platforms:
         翻译助手: {}
       # 连续对话窗口期（最终回复播完后 VAD 直接听，无需再喊唤醒词）
       conversation_window_sec: 5.0
-      # 身份前缀：仅 send 兜底路径（多唤醒词并发）使用，LLM 回复不加
-      identity_prefix: true
 
     # 每个唤醒词独立的 system_prompt / model / provider（gateway 原生机制）
     channel_overrides:

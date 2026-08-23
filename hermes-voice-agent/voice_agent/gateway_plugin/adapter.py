@@ -19,7 +19,6 @@ voice-platform 适配器：语音平台（sherpa 唤醒词 + VAD + 腾讯云 ASR
             小布: { session_id: "hermes-voice-小布", system_prompt: "..." }
             翻译助手: { session_id: "hermes-voice-翻译助手" }
           conversation_window_sec: 5.0   # 最终回复播完后的连续对话窗口期
-          identity_prefix: true          # 播报前加 "我是{唤醒词}，" 前缀
           kws:                           # sherpa 模型路径（默认取项目 models/）
             model_dir: "models/sherpa-kws"
             model_name: "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
@@ -159,8 +158,6 @@ class VoiceAdapter(BasePlatformAdapter):
         self._conversation_window_sec = float(
             extra.get("conversation_window_sec", 5.0)
         )
-        # 身份前缀：多唤醒词共用扬声器时，播报前加 "我是{唤醒词}，"
-        self._identity_prefix = bool(extra.get("identity_prefix", True))
 
         # gateway 事件循环（connect 时记录，供 SDK 回调线程投递）
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -198,7 +195,7 @@ class VoiceAdapter(BasePlatformAdapter):
         # extra 顶层键直接覆盖语音配置的对应段
         merged = dict(base)
         for key, value in self._extra.items():
-            if key in ("wakewords", "identity_prefix", "conversation_window_sec",
+            if key in ("wakewords", "conversation_window_sec",
                        "kws", "asr", "vad", "tts", "voiceprint", "mic"):
                 if isinstance(value, dict) and isinstance(merged.get(key), dict):
                     merged[key] = {**merged[key], **value}
@@ -394,8 +391,8 @@ class VoiceAdapter(BasePlatformAdapter):
     # ─── outbound：gateway 回复 → 播报 ───────────────────
 
     def _with_identity_prefix(self, wake: str, segments: List[tuple[str, str]]):
-        """身份前缀（可选）：多唤醒词共用扬声器时区分谁在说话。"""
-        if self._identity_prefix and wake and segments:
+        """身份前缀：多唤醒词共用扬声器时区分谁在说话。"""
+        if wake and segments:
             emo, first = segments[0]
             segments[0] = (emo, f"我是{wake}，{first}")
         return segments
@@ -850,10 +847,41 @@ def register(ctx) -> None:
         allow_all_env="VOICE_ALLOW_ALL_USERS",
         emoji="🎙️",
         platform_hint=(
-            "你通过语音与用户交流：回复要简洁（3 句话以内），最终回答用 "
-            "(情绪)文字 格式（情绪可选 neutral/sad/happy/angry/...）；"
-            "工具调用过程中的阶段性说明直接作为文字回复输出，会被立即播报；"
-            "使用播放控制工具后直接返回 [FINISH]。"
+            '【语音交互说明】\n'
+            '1. 用户的输入来自语音识别（ASR），可能存在同音字、漏字、多字等错误。\n'
+            '   如果问题听起来不合逻辑，结合上下文做合理推断，而不是逐字照搬。\n'
+            '2. 回答要简洁，控制在 3 句话以内。\n'
+            '   需要列举时用「第一、第二、第三」代替长段落。\n'
+            '3. 回答中自然融入确认——不是生硬复述，而是把确认编织在回答里。\n'
+            '   例如用户说「今天天气怎么样」，不要说「你是问今天天气吗？」\n'
+            '   直接说「今天晴天，25度，适合出门。」\n'
+            '   如果确实听清了，不需要额外确认。\n'
+            '4. 如果实在听不懂，直接表示没听清。\n'
+            '\n'
+            '【说话人标识说明】\n'
+            '发送给你的每条用户消息会以 [说话人身份] 前缀标注这句话是谁说的，\n'
+            '例如「[爸爸] 今天天气怎么样？」；多人连续说话时每句单独标注，如\n'
+            '「[爸爸] 今天天气怎么样？\n[妈妈] 顺便查下明天的」。说话人身份用于\n'
+            '帮助你理解对话上下文（例如区分不同家庭成员提出的问题），回答时\n'
+            '不需要复述说话人。\n'
+            '\n'
+            '【语音播报规则】\n'
+            '你的每条文字回复都会被系统实时语音播报给用户（无需调用任何播报工具）。\n'
+            '- 工具调用过程中的阶段性说明（如「让我搜索网络」）请直接作为文字回复输出，\n'
+            '  系统会立即播报；不需要文字说明的纯工具调用轮次可以只返回工具调用。\n'
+            '- 文字格式回复可以带上情绪标识，格式为：(情绪)你要说的话\n'
+            '  例如：(happy)你好，有什么可以帮助你的？\n'
+            '  情绪可选值：neutral(中性) sad(悲伤) happy(高兴) angry(生气) fear(恐惧) '
+            'story(故事) poetry(诗歌) sajiao(撒娇) disgusted(厌恶) amaze(震惊) exciting(兴奋) '
+            'aojiao(傲娇) jieshuo(解说)\n'
+            '\n'
+            '【播放控制工具规则】\n'
+            '你拥有 mpd_ 系列工具用于控制音乐播放（如 mpd_play、mpd_pause、mpd_stop、\n'
+            'mpd_previous、mpd_next 等）。\n'
+            '- 当你使用播放控制工具时，播放控制工具执行后直接返回 [FINISH] 作为文字回复，\n'
+            '  该条文字回复不要使用 (情绪)格式。\n'
+            '- [FINISH] 表示操作已完成，系统会自动关闭对话窗口，\n'
+            '  用户可以通过再次说唤醒词来继续对话。'
         ),
     )
     ctx.register_hook("post_api_request", on_post_api_request)
