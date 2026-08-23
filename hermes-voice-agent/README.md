@@ -132,6 +132,34 @@ AI 的最终回答请以 **`(情绪)文字内容`** 格式返回，例如：
 - 播放控制类工具执行后模型直接返回 `[FINISH]` 作为文字回复
 - VoiceApp 在回调中识别 `[FINISH]`：不播报，直接关闭对话窗口
 
+## 部署方案
+
+本项目提供两种部署方式：
+
+### 方案一：Hermes Gateway 插件（推荐）
+
+将语音交互做成 hermes gateway 平台插件 `voice-platform`：
+
+- 会话/记忆由 gateway 统一管理，每个唤醒词一个独立固定会话
+- 可与飞书等消息平台共存于同一 gateway
+- 配置统一在 profile 目录（`~/.hermes/`）：语音参数在 `voice-agent.yaml`，
+  模型/凭据不再依赖项目目录
+- 通过 pip entry-point 分发（`hermes_agent.plugins`），可开放给所有 hermes 用户
+
+**详细安装与配置见 [`docs/gateway-voice-plugin-usage.md`](docs/gateway-voice-plugin-usage.md)。**
+
+```bash
+pip install -e .
+hermes plugins enable voice-platform
+python -u tools/download_models.py                 # 下载模型到 ~/.hermes/models/
+python -u tools/gen_keywords.py                    # 生成唤醒词 keywords.txt
+systemctl --user enable --now hermes-gateway       # 用户服务（可访问音频设备）
+```
+
+### 方案二：独立应用（VoiceApp，原方案）
+
+`python -m voice_agent` 独立运行、自管 agent 会话。见下方「快速开始」。
+
 ## 快速开始
 
 ### 1. 安装 Hermes Agent
