@@ -76,6 +76,8 @@ _SYSTEM_NOTICE_PREFIXES = (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 NOTIFICATION_PATH = PROJECT_ROOT / "assets" / "notification.wav"
 PROMPT_PATH = PROJECT_ROOT / "assets" / "prompt.wav"
+FAREWELL_PATH = PROJECT_ROOT / "assets" / "farewell.wav"
+WAIT_TONE_PATH = PROJECT_ROOT / "assets" / "wait_cue_4_scale.wav"
 
 # ─── (情绪)文字 分段解析（与 VoiceApp 保持一致）────────────
 
@@ -176,6 +178,11 @@ class VoiceAdapter(BasePlatformAdapter):
         # 钩子最近播报的最终回复（chat_id → 文本）：send() 去重用
         self._last_final_by_chat: Dict[str, str] = {}
 
+        # 等待回复提示音：ASR 结束后、LLM 回复/TTS 开始前循环播放
+        # （提示用户当前不再收听）。_wait_tone_waiting 为等待计数。
+        self._wait_tone_waiting = 0
+        self._wait_tone_task: Optional[asyncio.Task] = None
+
     # ─── 配置解析 ────────────────────────────────────────
 
     def _resolve_voice_cfg(self) -> Dict[str, Any]:
@@ -235,6 +242,7 @@ class VoiceAdapter(BasePlatformAdapter):
     async def _cleanup_partial(self) -> None:
         """清理已创建的资源（connect 失败或 disconnect 时调用，幂等）。"""
         _set_active_instance(None)
+        self._stop_wait_tone()
         if self._frontend:
             try:
                 self._frontend.stop()
@@ -337,6 +345,8 @@ class VoiceAdapter(BasePlatformAdapter):
             on_interrupt_request=self._on_interrupt_request,
             on_play_prompt=self._play_prompt,
             prompt_duration_sec=self._prompt_duration_sec(),
+            # 连续对话窗口超时：播放告别语，回到唤醒词监听
+            on_conversation_timeout=self._play_farewell,
         )
         self._frontend = VoiceFrontend(front_cfg, self._asr)
 
@@ -349,18 +359,29 @@ class VoiceAdapter(BasePlatformAdapter):
         except Exception:
             return 1.0
 
-    def _play_prompt(self) -> None:
-        """唤醒词命中提示音（greeting）：VoiceFrontend 唤醒时回调播放。"""
-        if self._player is None or not PROMPT_PATH.exists():
+    def _play_asset(self, name: str) -> None:
+        """播放 assets/ 下的 WAV 资产（prompt/farewell/notification）。"""
+        path = {"prompt": PROMPT_PATH,
+                "farewell": FAREWELL_PATH,
+                "notification": NOTIFICATION_PATH}.get(name)
+        if path is None or self._player is None or not path.exists():
             return
         try:
             import wave
-            with wave.open(str(PROMPT_PATH), "rb") as wf:
+            with wave.open(str(path), "rb") as wf:
                 data = wf.readframes(wf.getnframes())
             self._player.feed(data)
-            logger.info("[voice] 🔊 播放唤醒提示音")
+            logger.info("[voice] 🔊 播放 %s", name)
         except Exception as exc:
-            logger.warning("[voice] 唤醒提示音播放失败: %s", exc)
+            logger.warning("[voice] %s 播放失败: %s", name, exc)
+
+    def _play_prompt(self) -> None:
+        """唤醒词命中提示音（greeting）：VoiceFrontend 唤醒时回调播放。"""
+        self._play_asset("prompt")
+
+    def _play_farewell(self) -> None:
+        """连续对话窗口超时的告别语。"""
+        self._play_asset("farewell")
 
     async def disconnect(self) -> None:
         """停止语音组件与监听（幂等，快速返回）。"""
@@ -472,6 +493,8 @@ class VoiceAdapter(BasePlatformAdapter):
             return
         from voice_agent.music_control import player_pause, player_resume
 
+        # 播报开始：停止等待提示音
+        self._stop_wait_tone()
         logger.info("[voice] 🔊 播报(%s): %d 段, 首段 %s...",
                     "最终" if is_final else "中间", len(segments), segments[0][1][:30])
         player_pause(force=True)
@@ -492,13 +515,16 @@ class VoiceAdapter(BasePlatformAdapter):
             time.sleep(0.15)
 
             if is_final:
-                self._play_asset_notification()
+                self._play_asset("notification")
                 if self._player:
                     self._player.wait_for_drain(timeout=5.0)
                     time.sleep(0.05)
                 # 播完进入连续对话窗口期：VAD 直接听，无需再喊唤醒词
                 if self._frontend:
                     self._frontend.enter_conversation_window()
+            else:
+                # 中间轮播完：agent 可能仍在处理，恢复等待提示音
+                self._start_wait_tone()
         finally:
             if self._tts:
                 self._tts.on_audio_chunk = self._player.feed
@@ -506,20 +532,70 @@ class VoiceAdapter(BasePlatformAdapter):
                 self._frontend.set_tts_playing(False)
             player_resume()
 
-    def _play_asset_notification(self) -> None:
-        """播放通知音（最终回复播完的提示）。"""
-        if not NOTIFICATION_PATH.exists() or self._player is None:
+    # ─── 等待回复提示音（思考中提示，不再收听）────────────
+
+    def _start_wait_tone(self) -> None:
+        """开始循环播放等待提示音（ASR 结束后、LLM 回复前）。
+
+        幂等：计数 +1；计数从 0 变 1 时启动播放任务。
+        可能从 ASR 回调线程调用，用 call_soon_threadsafe 调度到事件循环。
+        """
+        self._wait_tone_waiting += 1
+        if self._wait_tone_task is not None:
+            return
+        if not WAIT_TONE_PATH.is_file():
+            logger.warning("[voice] 等待提示音文件缺失: %s", WAIT_TONE_PATH)
+            return
+        if self._loop is None:
             return
         try:
+            from voice_agent.music_control import player_pause
+            player_pause(force=True)
+        except Exception:
+            pass
+        if self._player:
+            self._player.clear()
+        self._loop.call_soon_threadsafe(self._spawn_wait_tone_task)
+
+    def _spawn_wait_tone_task(self) -> None:
+        """事件循环线程内创建提示音播放任务（供 call_soon_threadsafe 调用）。"""
+        if self._wait_tone_task is None:
+            self._wait_tone_task = asyncio.ensure_future(self._wait_tone_loop())
+
+    def _stop_wait_tone(self) -> None:
+        """停止等待提示音（TTS 开始 / 对话结束 / 打断时调用）。
+
+        幂等：计数 -1；计数归 0 时取消播放任务并清空播放队列。
+        """
+        if self._wait_tone_waiting > 0:
+            self._wait_tone_waiting -= 1
+        if self._wait_tone_waiting == 0 and self._wait_tone_task is not None:
+            self._wait_tone_task.cancel()
+            self._wait_tone_task = None
+            if self._player:
+                self._player.clear()
+
+    async def _wait_tone_loop(self) -> None:
+        """循环把等待提示音 PCM 喂给播放器（按播放时长节流）。"""
+        try:
             import wave
-            with wave.open(str(NOTIFICATION_PATH), "rb") as wf:
+            with wave.open(str(WAIT_TONE_PATH), "rb") as wf:
                 data = wf.readframes(wf.getnframes())
-            self._player.feed(data)
+            if not data:
+                return
+            # 每段 2s，feed 后按播放时长 sleep，实现无缝循环
+            while True:
+                if self._player:
+                    self._player.feed(data)
+                await asyncio.sleep(len(data) / 32000.0)  # 16k 16bit = 32KB/s
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
-            logger.warning("[voice] 通知音播放失败: %s", exc)
+            logger.warning("[voice] 等待提示音播放异常: %s", exc)
 
     def _close_conversation_window(self) -> None:
         """关闭对话窗口（[FINISH] / 打断时），回到唤醒词监听。"""
+        self._stop_wait_tone()
         if self._frontend is None:
             return
         try:
@@ -588,6 +664,8 @@ class VoiceAdapter(BasePlatformAdapter):
                 asyncio.run_coroutine_threadsafe(
                     self.handle_message(event), self._loop
                 )
+            # 用户已说完，开始等待 LLM 回复：循环播放提示音（提示不再收听）
+            self._start_wait_tone()
         except Exception as exc:
             logger.warning("[voice] ASR 完成处理异常: %s", exc)
 
@@ -711,6 +789,7 @@ def on_post_api_request(**kwargs):
     adapter = _get_active_instance()
     if adapter is None:
         return
+    logger.info(str(kwargs))
     try:
         finish_reason = kwargs.get("finish_reason") or ""
         assistant = kwargs.get("assistant_message")
