@@ -180,6 +180,17 @@ class VoiceAdapter(BasePlatformAdapter):
         self._wait_tone_waiting = 0
         self._wait_tone_task: Optional[asyncio.Task] = None
 
+        # 说话人识别（voiceprint 启用时非 None）：
+        # _vp_round 收集本轮每个句子的 (显示名, 文本)，on_complete 时拼成
+        # "[说话人] 内容" 消息发给 LLM；_vp_id_cache 缓存腾讯云 speaker_id →
+        # (库id, 相似度)，同 speaker_id 只做一次声纹识别（低延迟）
+        self.voiceprint = None
+        self._vp_round: List[tuple[str, str]] = []
+        self._vp_id_cache: dict = {}
+        self._vp_auto_register = True
+        self._vp_min_register_sec = 1.5
+        self._vp_use_cache = True
+
     # ─── 配置解析 ────────────────────────────────────────
 
     def _resolve_voice_cfg(self) -> Dict[str, Any]:
@@ -221,6 +232,7 @@ class VoiceAdapter(BasePlatformAdapter):
                 return False
 
             vcfg = self._resolve_voice_cfg()
+            self._init_voiceprint(vcfg)
             self._init_asr(vcfg)
             self._init_frontend(vcfg)
             self._init_playback(vcfg)
@@ -283,6 +295,36 @@ class VoiceAdapter(BasePlatformAdapter):
         self._playback_queue = asyncio.Queue()
         self._playback_task = asyncio.create_task(self._playback_consumer())
 
+    def _init_voiceprint(self, vcfg: Dict[str, Any]) -> None:
+        """装配说话人识别（voiceprint.enabled 时）：CAM++ 声纹 + 特征库。
+
+        lib_dir 走 profile 约定（<profile>/models/voiceprint_lib/）。
+        CAM++ 模型缺失时降级（voiceprint=None，不阻断语音链路）。
+        """
+        vp_cfg = vcfg.get("voiceprint", {})
+        if not vp_cfg.get("enabled", False):
+            return
+        from voice_agent.voiceprint import VoiceprintManager
+
+        try:
+            self.voiceprint = VoiceprintManager(
+                lib_dir=resolve_voiceprint_lib_dir(vcfg),
+                threshold=vp_cfg.get("threshold", 0.6),
+                speaker_names=vp_cfg.get("speaker_names", {}),
+            )
+            self._vp_auto_register = vp_cfg.get("auto_register", True)
+            self._vp_min_register_sec = vp_cfg.get("min_register_sec", 1.5)
+            self._vp_use_cache = vp_cfg.get("speaker_id_cache", True)
+            if self.voiceprint.extractor is None:
+                logger.warning("[voice] CAM++ 声纹模型不可用，说话人识别降级")
+                self.voiceprint = None
+            else:
+                logger.info("[voice] 说话人识别已启用（特征库: %s）",
+                            resolve_voiceprint_lib_dir(vcfg))
+        except Exception as exc:
+            logger.warning("[voice] 说话人识别初始化失败（降级）: %s", exc)
+            self.voiceprint = None
+
     def _init_asr(self, vcfg: Dict[str, Any]) -> None:
         """装配腾讯云 ASR 引擎（凭据来自 env VOICE_*，与现有 voice_agent 一致）。"""
         from voice_agent.asr_engine import TencentASRConfig, TencentCloudASREngine
@@ -295,12 +337,18 @@ class VoiceAdapter(BasePlatformAdapter):
             engine_model=asr_cfg.get("engine_model", "16k_zh"),
             needvad=asr_cfg.get("needvad", False),
             voice_format=asr_cfg.get("voice_format", 1),
+            # 说话人分离：需 speaker 引擎（16k_zh_en_speaker_2.0），供本地声纹识别
+            enable_speaker_context=1 if self.voiceprint else 0,
         ))
         # 服务端 VAD 可能在用户句间停顿时提前回调 on_final，这里只认
         # on_complete（整段说完）→ last_text 兜底，与 VoiceApp 一致
         self._asr.on_final = None
         self._asr.on_complete = self._on_asr_complete
         self._asr.on_error = self._on_asr_error
+        self._asr.on_start = self._on_asr_start
+        if self.voiceprint:
+            # 每完成一个句子 → 本地声纹识别说话人（并行旁路）
+            self._asr.on_sentence = self._on_asr_sentence
 
     def _init_frontend(self, vcfg: Dict[str, Any]) -> None:
         """装配语音前端（唤醒词 + VAD + 麦克风 → ASR 桥接）。"""
@@ -621,6 +669,67 @@ class VoiceAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[voice] 打断处理异常: %s", exc)
 
+    def _on_asr_start(self) -> None:
+        """新一轮 ASR 会话：重置说话人识别上下文。"""
+        self._vp_round.clear()
+        self._vp_id_cache.clear()
+
+    def _on_asr_sentence(self, info: dict) -> None:
+        """
+        腾讯云每完成一个句子 → 本地声纹识别说话人（并行旁路，不影响主链路）。
+
+        识别结果收集到 _vp_round，on_complete 时拼成 "[说话人] 内容" 消息发给
+        LLM；新说话人按配置自动分配 id 注册；同 speaker_id 缓存避免重复声纹
+        计算。逻辑与 VoiceApp 模式一致。
+        """
+        if self.voiceprint is None:
+            return
+        text = info.get("text", "").strip()
+        if not text:
+            return
+        tx_spk = info.get("speaker_id", 0)
+        try:
+            # 1) speaker_id 缓存：同一会话同一人只做一次声纹识别
+            if self._vp_use_cache and tx_spk in self._vp_id_cache:
+                spk_id, score = self._vp_id_cache[tx_spk]
+                name = self.voiceprint.display_name(spk_id)
+                logger.info("🗣️ [%s] %s（相似度 %.2f，缓存）", name, text, score)
+                self._vp_round.append((name, text))
+                return
+
+            # 2) 按腾讯云句子时段截取音频 → 声纹识别
+            samples = self._asr.get_sentence_audio(info)
+            if samples is None or len(samples) == 0:
+                logger.warning("🗣️ 无法获取句子音频（缓冲不足）: %s", text[:20])
+                return
+            spk_id, score = self.voiceprint.identify(samples)
+
+            if spk_id is None:
+                # 新说话人：满足最短时长门槛才自动注册，避免劣质声纹入库
+                if (self._vp_auto_register
+                        and len(samples) / 16000 >= self._vp_min_register_sec):
+                    new_id = self.voiceprint.register(samples)
+                    if new_id:
+                        spk_id, score = new_id, 1.0
+                        name = self.voiceprint.display_name(spk_id)
+                        logger.info("🗣️ [新说话人] %s → 已注册为 %s", text, name)
+                    else:
+                        name = "未知"
+                        logger.info("🗣️ [未知] %s（注册失败，相似度 %.2f）", text, score)
+                else:
+                    name = "未知"
+                    logger.info("🗣️ [未知] %s（相似度 %.2f）", text, score)
+            else:
+                name = self.voiceprint.display_name(spk_id)
+                logger.info("🗣️ [%s] %s（相似度 %.2f）", name, text, score)
+
+            self._vp_round.append((name, text))
+            # 3) 缓存本次识别的 speaker_id（后续该人句子零声纹延迟）
+            if self._vp_use_cache and spk_id:
+                self._vp_id_cache[tx_spk] = (spk_id, score)
+        except Exception as exc:
+            logger.warning("说话人识别异常: %s", exc)
+
     def _on_asr_complete(self) -> None:
         """ASR 整段识别完成（SDK 回调线程）：文本 → MessageEvent → gateway 会话。"""
         try:
@@ -629,7 +738,12 @@ class VoiceAdapter(BasePlatformAdapter):
                 logger.info("[voice] ASR 结果为空，跳过")
                 return
             wake = self._current_wake or next(iter(self._wakewords), "")
-            logger.info("[voice] 用户说了: %s", text[:60])
+            # 说话人识别启用时：把本轮每句 "[说话人] 内容" 拼成消息发给 LLM
+            msg = text
+            if self.voiceprint is not None and self._vp_round:
+                msg = "\n".join(f"[{spk}] {t}" for spk, t in self._vp_round)
+                self._vp_round.clear()
+            logger.info("[voice] 用户说了: %s", msg[:60])
 
             source = self.build_source(
                 chat_id=self.wake_chat_id(wake),
@@ -639,7 +753,7 @@ class VoiceAdapter(BasePlatformAdapter):
                 user_name="用户",
             )
             event = MessageEvent(
-                text=text,
+                text=msg,
                 message_type=MessageType.TEXT,
                 source=source,
                 message_id=f"voice-{int(time.time() * 1000)}",
