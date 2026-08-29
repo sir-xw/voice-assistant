@@ -390,32 +390,17 @@ class VoiceAdapter(BasePlatformAdapter):
 
     # ─── outbound：gateway 回复 → 播报 ───────────────────
 
-    def _with_identity_prefix(self, wake: str, segments: List[tuple[str, str]]):
-        """身份前缀：多唤醒词共用扬声器时区分谁在说话。"""
-        if wake and segments:
-            emo, first = segments[0]
-            segments[0] = (emo, f"我是{wake}，{first}")
-        return segments
-
     def _enqueue_playback(
         self,
         wake: str,
         segments: List[tuple[str, str]],
         is_final: bool,
-        with_prefix: bool = False,
     ) -> None:
-        """线程安全地把一条播报投进串行播放队列（钩子/兜底路径共用）。
-
-        with_prefix：仅 send 兜底路径（跨会话/异常内容）需要身份前缀；
-        钩子播报的 LLM 回复必然是当前对话，不加前缀。
-        """
+        """线程安全地把一条播报投进串行播放队列（钩子/兜底路径共用）。"""
         if self._loop is None or self._playback_queue is None:
             return
-        segs = list(segments)
-        if with_prefix:
-            segs = self._with_identity_prefix(wake, segs)
         asyncio.run_coroutine_threadsafe(
-            self._playback_queue.put((wake, segs, is_final)), self._loop
+            self._playback_queue.put((wake, list(segments), is_final)), self._loop
         )
 
     async def send(
@@ -456,13 +441,16 @@ class VoiceAdapter(BasePlatformAdapter):
             logger.info("[voice] 系统通知已静默: %s", text[:60])
             return SendResult(success=True)
 
-        # 兜底：钩子未播报的内容（异常路径）按最终回复播报，带身份前缀
+        # 兜底：钩子未播报的内容（gateway 工具轮文本 / 异常路径）。
+        # 正常情况最终轮必由钩子播报（post_api_request stop），因此这里
+        # 到达的内容大多是中间轮文本——按中间轮处理（is_final=False，
+        # 只播报，不播通知音、不进对话窗口），也无身份前缀。
         if self._playback_queue is None:
             return SendResult(success=False, error="播报队列未就绪")
         segments = parse_emotion_segments(text)
         if not segments:
             return SendResult(success=True)
-        self._enqueue_playback(wake, segments, True, with_prefix=True)
+        self._enqueue_playback(wake, segments, False)
         logger.info("[voice] send 兜底播报 → %s: %s", wake, text[:60])
         return SendResult(success=True)
 
