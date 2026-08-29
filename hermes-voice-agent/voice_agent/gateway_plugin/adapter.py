@@ -674,6 +674,21 @@ class VoiceAdapter(BasePlatformAdapter):
         self._vp_round.clear()
         self._vp_id_cache.clear()
 
+    def _refresh_speaker_names(self) -> None:
+        """从 profile 配置同步 speaker_names（内容比较，更新后自动生效）。
+
+        修改 ~/.hermes/voice-agent.yaml 的 voiceprint.speaker_names 后，
+        下一次句子识别时自动重载，无需重启 gateway。配置文件很小，
+        每句读取一次开销可忽略；仅在实际变化时更新与记录日志。
+        """
+        if self.voiceprint is None:
+            return
+        cfg = load_voice_config()
+        names = (cfg.get("voiceprint") or {}).get("speaker_names") or {}
+        if dict(names) != self.voiceprint.speaker_names:
+            self.voiceprint.speaker_names = dict(names)
+            logger.info("[voice] speaker_names 已重载: %s", names)
+
     def _on_asr_sentence(self, info: dict) -> None:
         """
         腾讯云每完成一个句子 → 本地声纹识别说话人（并行旁路，不影响主链路）。
@@ -684,6 +699,8 @@ class VoiceAdapter(BasePlatformAdapter):
         """
         if self.voiceprint is None:
             return
+        # speaker_names 配置变更自动重载（mtime 缓存，无变化零开销）
+        self._refresh_speaker_names()
         text = info.get("text", "").strip()
         if not text:
             return
