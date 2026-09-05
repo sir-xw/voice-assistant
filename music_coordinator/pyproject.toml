@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "music-coordinator"
+version = "0.1.0"
+description = "音乐状态协调器：MPD 的唯一写入口。intent API 以 MCP server 暴露给 hermes agent（LLM 工具调用），hold API 经 Unix socket 提供给 Voice Service（TTS 播报避让）。零 hermes 依赖。"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "python-mpd2>=3.1.1",
+]
+
+[project.optional-dependencies]
+# MCP 工具面（tools_mcp.py）以 streamable HTTP（web 端口）方式暴露，需要：
+#   pip install -e "./music_coordinator[mcp]"
+# 注：pin mcp<2 —— 目前按 FastMCP v1 API 编写（与 hermes 侧 mcp 1.26 一致）；
+#     若迁 mcp 2.x，tools_mcp 需改用 mcp.server.mcpserver.MCPServer。
+mcp = ["mcp>=1.0,<2", "uvicorn>=0.29"]
+
+[tool.setuptools.packages.find]
+include = ["music_coordinator*"]
+
+[project.scripts]
+music-coordinator = "music_coordinator.__main__:main"

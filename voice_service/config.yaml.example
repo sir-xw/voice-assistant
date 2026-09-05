@@ -1,0 +1,75 @@
+# Voice Service（voice_service）独立配置 —— 脱敏模板。
+# 部署：复制为 config.yaml 后按需修改（config.yaml 已被 .gitignore 排除，不入库）。
+#   cp config.yaml.example config.yaml
+# 凭据：同目录 .env（VOICE_SecretId/Key/AppId，gitignore）；模型：同目录 models/（gitignore）。
+# 结构说明见 hermes-voice-agent/docs/voice-service-websocket-architecture.md §4.4。
+
+voice_service:
+  service:
+    host: "127.0.0.1"             # 跨机部署改为 0.0.0.0 并设置 token
+    port: 8765
+    token: ""                     # 空 = 仅本机；非空时 gateway 侧须配相同值
+    ping_interval_sec: 20
+    heartbeat_timeout_sec: 60
+    wait_reply_timeout_sec: 45
+
+  wake_word:
+    enabled: true
+    # 唤醒词 ↔ 助手映射（**唯一维护源**，hermes 侧不再配置 wakewords）：
+    #   name     助手名（= KWS keywords.txt 的 @后缀 = gateway chat_id "wake:<name>"）
+    #   keywords 实际触发短语（可多个；命中任意一个都归一为该助手名上行）
+    # Voice Service 启动时按此生成/校验 models/sherpa-kws/*/keywords.txt
+    # （voice_service/kws_words.py；修改后重启 voice-service 即生效）。
+    assistants:
+      - name: 示例助手
+        keywords: ["你好示例"]
+
+  kws:
+    threshold: 0.25               # 唤醒灵敏度（越高越严格）
+    model_name: "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+    encoder: "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx"
+    decoder: "decoder-epoch-13-avg-2-chunk-8-left-64.onnx"
+    joiner: "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx"
+    tokens: "tokens.txt"
+
+  vad:
+    mode: 3
+    min_speech_ms: 200
+    silence_threshold_ms: 1000
+    speech_confirm_frames: 3
+    wake_guard_sec: 5.0
+
+  mic:
+    sample_rate: 0                # 0=自动
+    device: auto                  # auto=自动（pipewire/pulse 优先）
+
+  asr:
+    engine_model: "16k_zh_en_speaker_2.0"   # 说话人分离引擎（voiceprint 用）
+    needvad: true
+    voice_format: 1
+
+  tts:
+    enabled: true
+    voice_type: 601009            # 腾讯云音色 id（按需替换）
+    codec: "pcm"
+    sample_rate: 16000
+    speed: 0.0
+    volume: 10.0
+
+  conversation_window:
+    timeout_sec: 5.0
+
+  voiceprint:
+    enabled: true
+    threshold: 0.6
+    lib_dir: "models/voiceprint_lib"
+    auto_register: true
+    min_register_sec: 1.5
+    speaker_id_cache: true
+    speaker_names:                # 声纹库 id → 显示名（按实际部署填写）
+      spk_100: "用户一"
+      spk_101: "用户二"
+
+  music_coordinator:
+    enabled: true
+    socket: "/run/user/<uid>/music-coordinator.sock"   # 替换 <uid> 为运行用户 uid
