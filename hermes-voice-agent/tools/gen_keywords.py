@@ -2,6 +2,12 @@
 """
 sherpa-onnx 唤醒词生成工具。
 
+【已退役声明】Voice Service 架构下（voice_assistant 三子项目）本脚本不再使用：
+唤醒词↔助手映射的唯一源是 `voice_service/config.yaml` 的 `wake_word.assistants`，
+由 `voice_service/voice_service/kws_words.py` 在 Voice Service 启动时自动生成/
+校验 `models/sherpa-kws/<model>/keywords.txt`；hermes 侧 `platforms.voice.extra.
+wakewords` 已不再配置。本文件仅作旧 hermes-voice-agent 架构的代码素材保留。
+
 默认行为：从 profile 配置读取唤醒词（每个唤醒词一个独立会话），
 同步生成 raw_keywords.txt，再转换为 sherpa-onnx 格式的 keywords.txt。
 
