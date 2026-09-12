@@ -17,3 +17,7 @@ voice_service/models/
 voice_service/config.yaml
 # 包内提示音资产需要入库（豁免上面的 *.wav）
 !voice_service/voice_service/assets/*.wav
+# 测试素材：4spk.wav（多说话人分离对比）需要入库；测试运行时生成的声纹库忽略
+!voice_service/tests/4spk.wav
+voice_service/tests/voiceprint_lib/
+voice_service/tests/voiceprint_sim_lib/
