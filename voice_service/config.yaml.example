@@ -2,7 +2,7 @@
 # 部署：复制为 config.yaml 后按需修改（config.yaml 已被 .gitignore 排除，不入库）。
 #   cp config.yaml.example config.yaml
 # 凭据：同目录 .env（VOICE_SecretId/Key/AppId，gitignore）；模型：同目录 models/（gitignore）。
-# 结构说明见 hermes-voice-agent/docs/voice-service-websocket-architecture.md §4.4。
+# 结构说明见 docs/voice-service-websocket-architecture.md §4.4。
 
 voice_service:
   service:

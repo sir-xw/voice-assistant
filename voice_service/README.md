@@ -23,7 +23,7 @@ python -m voice_service --config config.yaml
 
 协议契约代码见 `voice_service/protocol.py`（零第三方依赖，可直接复制到客户端；
 `hermes_gateway_plugin` 即复用同一模块）。详细架构设计见
-`hermes-voice-agent/docs/voice-service-websocket-architecture.md`。
+`docs/voice-service-websocket-architecture.md`。
 
 ## 部署（systemd user 服务，本机实测）
 

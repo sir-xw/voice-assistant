@@ -46,7 +46,7 @@ hermes gateway 进程 ─────────────► gateway 会话�
 | 痛点 | 拆分后 |
 |---|---|
 | gateway 进程被音频栈污染：sherpa-onnx / 腾讯云语音 SDK / PortAudio / PipeWire 的崩溃（含 C 层 segfault 风险）会拖垮整个 LLM 网关 | 音频故障只影响 Voice Service，独立重启、独立降级 |
-| 修一次 USB 麦克风要重启整个 gateway（`tools/repair_usb_audio.sh` 连带重启） | 修复只动 Voice Service：`repair_usb_audio.sh` 先停 voice-service → 重建 USB → 再启动，gateway 无感 |
+| 修一次 USB 麦克风要重启整个 gateway | 修复只影响音频相关服务/音频栈，gateway 无感 |
 | 音频组件强依赖 `pipewire`/用户会话等运行环境，gateway 被迫做成 user service 并挂音频依赖 | gateway 回归纯网络服务，可任意部署/迁移；音频环境只需 Voice Service 满足 |
 | gateway 重启期间整条语音链路不可用 | Voice Service 持续监听；gateway 重启后客户端自动重连即恢复 |
 | 语音能力与 hermes 绑定死，无法被其它 agent/前端复用 | Voice Service 暴露标准 WS 接入点，未来可服务多个/其它客户端（协议已预留） |
@@ -81,7 +81,7 @@ hermes gateway 进程 ─────────────► gateway 会话�
 
 | 职责 | Voice Service（新进程） | Hermes Voice Gateway（改造 adapter） |
 |---|---|---|
-| 音频采集/设备选择/重采样/采集失效检测（无数据→关流告警，恢复靠进程重启 + `repair_usb_audio.sh` 协作） | ✅ | ❌ |
+| 音频采集/设备选择/重采样/采集失效检测（无数据→关流告警，恢复靠重启语音服务进程） | ✅ | ❌ |
 | 唤醒词检测（sherpa KWS + keywords.txt） | ✅ | ❌ |
 | WebRTC VAD / 连续对话窗口 / 提示音 / 告别语 / 等待提示音 | ✅（语音侧状态机整体迁移） | ❌ |
 | 腾讯云 ASR（WebSocket、句子回调、音频缓冲） | ✅ | ❌ |
@@ -452,7 +452,7 @@ RestartSec=3
 - `hermes-gateway.user.service` 的音频 drop-in（`audio.conf`：`After/Wants=pipewire…`）**可移除**，gateway 不再依赖音频栈；
 - `hermes-voice-agent.service`（VoiceApp）退役；
 - 新增 **`music-coordinator.service`**（§10）：独立常驻进程，`python -m music_coordinator`；不依赖音频栈，但需可连 MPD（localhost:6600），供 hermes（MCP intent）与 Voice Service（hold IPC）双方访问；
-- `usb-audio-health/repair`、音量服务逻辑不变，只是作用对象变成 Voice Service：修复流程改为「先停 voice-service → 重建 USB 音频栈 → 再启动 voice-service」（已不再需要 pause 标记协作，见 §4.4/工具脚本）。
+- 音频设备运维（健康检测/修复/音量）脚本与 systemd 单元为环境特定内容，已移出本仓库、不随项目分发。
 
 ### 6.3 启动顺序与降级
 

@@ -86,7 +86,7 @@ class VoiceFrontendConfig:
     # 的 open/close 可能触发 C 层崩溃（segfault / cffi 断言失败），因此运行中
     # 检测到失效【只关闭流并节流告警，不自动反复重建】——关闭"活着但无数据"
     # 的 PortAudio 流正是消除其原生线程空转烧 CPU 的关键；恢复统一走进程重启
-    # （tools/repair_usb_audio.sh 会 stop/start voice-service.service，
+    # （重启 voice-service.service，
     # 新进程 start() 时重新 open 采集流）。
     mic_no_data_timeout_sec: float = 3.0
     # 无数据关闭流后到下次告警的冷却秒数（避免设备长期故障时反复刷屏）
@@ -548,7 +548,7 @@ class VoiceFrontend:
         cffi 断言失败，见 agent.log "Fatal Python error"）。因此运行中检测到
         采集失效时【只关闭流并节流告警】，不自动反复重建 —— 避免在音频栈
         异常时反复 open/close 把进程弄崩。恢复统一走 voice-service 进程重启
-        （tools/repair_usb_audio.sh 会 stop/start voice-service.service，
+        （重启 voice-service.service，
         新进程 start() 会重新 open 采集流）。
         """
         if not self._running:
@@ -562,8 +562,7 @@ class VoiceFrontend:
             if now < self._mic_cooldown_until:
                 return
             logger.error("麦克风采集无数据超过 %gs：已关闭采集流；恢复请重启 "
-                         "voice-service（tools/repair_usb_audio.sh 或 "
-                         "systemctl --user restart voice-service）",
+                         "voice-service（systemctl --user restart voice-service）",
                          self.config.mic_no_data_timeout_sec)
             self._close_input_stream()
             self._mic_cooldown_until = now + self.config.mic_fail_cooldown_sec

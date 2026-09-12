@@ -6,7 +6,7 @@ VAD、TTS、播放队列、连续对话窗口全部由服务端负责。
 
 - 参考实现（可复制到你的项目）：[`voice_service/protocol.py`](voice_service/protocol.py)（零第三方依赖，仅标准库）
 - 本仓库的 hermes 接入示例：[`hermes_gateway_plugin/`](../hermes_gateway_plugin/)
-- 架构与部署（本机实测记录）：[`../hermes-voice-agent/docs/voice-service-websocket-architecture.md`](../hermes-voice-agent/docs/voice-service-websocket-architecture.md)
+- 架构与部署（本机实测记录）：[`../docs/voice-service-websocket-architecture.md`](../docs/voice-service-websocket-architecture.md)
 
 > 约定：本文件描述的是**线上行为**；常量名与帧结构以 `protocol.py` 为准。协议版本 `v=1`。
 

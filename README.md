@@ -19,7 +19,7 @@
 - **[`hermes_gateway_plugin/`](hermes_gateway_plugin/)**：hermes 的 voice 平台插件，作为 Voice Service 的 **WS 客户端**，把语音识别结果变成 gateway 会话消息（`chat_id=wake:<助手名>`）、把 LLM 回复文本下发朗读。**唯一与 hermes 绑定的子包**。
 - **[`music_coordinator/`](music_coordinator/)**：MPD 的唯一写入口（intent 意图 + hold 避让状态机），经 **MCP（streamable HTTP）** 向 Agent 暴露 `mpd_*` 音乐控制工具。零 hermes 依赖。
 
-架构、协议与部署设计详见 [`hermes-voice-agent/docs/voice-service-websocket-architecture.md`](hermes-voice-agent/docs/voice-service-websocket-architecture.md)。
+架构、协议与部署设计详见 [`docs/voice-service-websocket-architecture.md`](docs/voice-service-websocket-architecture.md)。
 
 ## 当前功能
 
