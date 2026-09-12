@@ -9,6 +9,8 @@
   - register(samples): 新说话人自动分配 spk_<N>（从 100 起）注册并持久化
   - display_name(id): 通过 config 的 speaker_names 映射显示真实身份
     （管理员在 config.yaml 把默认 id 改为真实身份，无需重建特征库）
+  - speaker_label(id): 拼上行给 agent 的说话人标签
+    （`爸爸 (ID: 100)` / `未知 (ID: 101)` / `未知`，见 PROTOCOL.md §5）
 
 特征库格式:
   lib_dir/embeddings.npz   每个说话人一个数组（N 段 × 192 维）
@@ -18,6 +20,7 @@
 
 import json
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -34,6 +37,17 @@ EMB_MODEL = PROJECT_ROOT / "models" / "sherpa-spk" / "3dspeaker_speech_campplus_
 
 # 自动注册的默认 id 起始编号（与测试库 spk_0~N 区分）
 DEFAULT_ID_START = 100
+
+# 未识别 / 未映射说话人的显示名
+UNKNOWN_SPEAKER = "未知"
+
+
+def speaker_number(spk_id: str | None) -> str | None:
+    """内部声纹 id（``spk_100``）→ 展示用编号（``100``）；其它形式原样返回。"""
+    if not spk_id:
+        return None
+    m = re.fullmatch(r"spk_(\d+)", spk_id)
+    return m.group(1) if m else spk_id
 
 
 def extract_embedding(extractor, samples: np.ndarray):
@@ -202,5 +216,18 @@ class VoiceprintManager:
     # ─── 显示 ────────────────────────────────────────────
 
     def display_name(self, spk_id: str) -> str:
-        """管理员配置映射（speaker_names）优先，无映射时显示默认 id。"""
-        return self.speaker_names.get(spk_id, spk_id)
+        """说话人展示名：``speaker_names`` 映射优先；未映射或未识别 → ``未知``。"""
+        if not spk_id:
+            return UNKNOWN_SPEAKER
+        return self.speaker_names.get(spk_id, UNKNOWN_SPEAKER)
+
+    def speaker_label(self, spk_id: str | None) -> str:
+        """上行给 agent 的说话人标签（PROTOCOL.md §5）。
+
+        格式：``爸爸 (ID: 100)`` / ``未知 (ID: 101)`` / ``未知``（无编号时）。
+        编号是声纹库 id 的数字部分 —— 管理员后来在 config 里把 ``spk_101`` 映射成
+        真实姓名，编号也不变，agent 因此能跨轮次稳定地区分同一个人。
+        """
+        number = speaker_number(spk_id)
+        name = self.display_name(spk_id)
+        return f"{name} (ID: {number})" if number else name

@@ -5,7 +5,8 @@
 上行到已连接的 hermes voice gateway（client）：
 
 - KWS 命中 → 上行 `wake_word`（本地提示音/打断行为在 M3 playback 接入前占位）
-- ASR 整段完成 → 上行 `asr_result`（voiceprint 启用时文本带 [说话人] 前缀）
+- ASR 整段完成 → 上行 `asr_result`（voiceprint 启用时文本按句带
+  `[名字 (ID: 编号)]` 前缀，格式见 PROTOCOL.md §5）
 - 本地回合号 `turn_seq` 随 asr_result 上行，客户端用它标记 speak 归属轮次
 
 硬件与模型路径约定：模型/关键词默认相对 **voice_service 子项目根**
@@ -232,7 +233,8 @@ class Inbound:
         try:
             if self._vp_use_cache and tx_spk in self._vp_id_cache:
                 spk_id, score = self._vp_id_cache[tx_spk]
-                self._vp_round.append((self.voiceprint.display_name(spk_id), text))
+                self._vp_round.append(
+                    (self.voiceprint.speaker_label(spk_id), text))
                 return
             samples = self.asr.get_sentence_audio(info)
             if samples is None or len(samples) == 0:
@@ -243,16 +245,16 @@ class Inbound:
                         and len(samples) / 16000 >= self._vp_min_register_sec):
                     new_id = self.voiceprint.register(samples)
                     spk_id = new_id if new_id else None
-            name = (self.voiceprint.display_name(spk_id)
-                    if spk_id else "未知")
-            self._vp_round.append((name, text))
+            # 未识别（含注册失败）→「未知」；自动注册但未映射 →「未知 (ID: 1xx)」，
+            # 编号稳定，agent 仍能区分不同陌生人
+            self._vp_round.append((self.voiceprint.speaker_label(spk_id), text))
             if self._vp_use_cache and spk_id:
                 self._vp_id_cache[tx_spk] = (spk_id, score)
         except Exception as exc:
             logger.warning("[inbound] 说话人识别异常: %s", exc)
 
     def _on_asr_complete(self) -> None:
-        """整段识别完成 → 上行 asr_result（含 voiceprint 说话人前缀）。"""
+        """整段识别完成 → 上行 asr_result（含 voiceprint 说话人标签前缀）。"""
         if self.asr is None:
             return
         text = (self.asr.last_text or "").strip()
@@ -261,7 +263,8 @@ class Inbound:
             return
         msg = text
         if self.voiceprint is not None and self._vp_round:
-            msg = "\n".join(f"[{spk}] {t}" for spk, t in self._vp_round)
+            # 每句: "[爸爸 (ID: 100)] 打开客厅灯"（多句换行）；格式见 PROTOCOL.md §5
+            msg = "\n".join(f"[{label}] {t}" for label, t in self._vp_round)
             self._vp_round.clear()
         self._turn_seq += 1
         logger.info("[inbound] 用户说: %s", msg[:60])

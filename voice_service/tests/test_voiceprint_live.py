@@ -3,9 +3,9 @@
 说话人识别集成模拟测试（无需麦克风）。
 
 把多说话人测试音频（tests/4spk.wav）分块 feed 进腾讯云实时识别引擎，
-触发 on_sentence 回调，走与 voice_service/main.py 相同的处理逻辑：
+触发 on_sentence 回调，走与 voice_service/inbound.py 相同的处理逻辑：
   句子音频截取（get_sentence_audio）→ CAM++ 声纹识别 → 新说话人自动注册
-  → speaker_id 缓存 → "[说话人] 内容" 消息拼装。
+  → speaker_id 缓存 → "[名字 (ID: 编号)] 内容" 消息拼装。
 
 用法（在 voice_service/ 目录下运行）:
     python -u tests/test_voiceprint_live.py            # 空库首次运行（注册新说话人）
@@ -89,9 +89,9 @@ def main():
         tx_spk = info.get("speaker_id", 0)
         if use_cache and tx_spk in vp_id_cache:
             spk_id, score = vp_id_cache[tx_spk]
-            name = vp.display_name(spk_id)
-            print(f"🗣️ [{name}] {text}（相似度 {score:.2f}，缓存）")
-            vp_round.append((name, text))
+            label = vp.speaker_label(spk_id)
+            print(f"🗣️ [{label}] {text}（相似度 {score:.2f}，缓存）")
+            vp_round.append((label, text))
             return
         samples = engine.get_sentence_audio(info)
         if samples is None or len(samples) == 0:
@@ -103,18 +103,15 @@ def main():
                 new_id = vp.register(samples)
                 if new_id:
                     spk_id, score = new_id, 1.0
-                    name = vp.display_name(spk_id)
-                    print(f"🆕 [新说话人] {text} → 已注册为 {name}")
+                    print(f"🆕 [新说话人] {text} → 已注册为 {spk_id}"
+                          f"（{vp.speaker_label(spk_id)}）")
                 else:
-                    name = "未知"
                     print(f"❔ [未知] {text}（注册失败，相似度 {score:.2f}）")
             else:
-                name = "未知"
                 print(f"❔ [未知] {text}（相似度 {score:.2f}）")
         else:
-            name = vp.display_name(spk_id)
-            print(f"🗣️ [{name}] {text}（相似度 {score:.2f}）")
-        vp_round.append((name, text))
+            print(f"🗣️ [{vp.speaker_label(spk_id)}] {text}（相似度 {score:.2f}）")
+        vp_round.append((vp.speaker_label(spk_id), text))
         if use_cache and spk_id:
             vp_id_cache[tx_spk] = (spk_id, score)
 
@@ -150,7 +147,7 @@ def main():
     engine.stop_recognition()
     done.wait(15)
 
-    # 消息拼装（与 main.py _on_frontend_final 相同）
+    # 消息拼装（与 inbound.py _on_asr_complete 相同）
     print(f"\n{'='*56}")
     print("📤 发送给 LLM 的聊天消息:")
     print(f"{'='*56}")

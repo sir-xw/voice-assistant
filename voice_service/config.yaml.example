@@ -68,7 +68,7 @@ voice_service:
     min_register_sec: 1.5
     speaker_id_cache: true
     speaker_names:                # 声纹库 id → 显示名（按实际部署填写）
-      spk_100: "用户一"
+      spk_100: "用户一"           # agent 收到的前缀: [用户一 (ID: 100)]
       spk_101: "用户二"
 
   music_coordinator:

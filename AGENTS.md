@@ -84,6 +84,17 @@
 - `post_api_request` 是 hermes **全局 observer 钩子**，必须按 `platform == "voice"` 过滤来源
   （已实现，勿移除），否则 CLI 等会话的回复也会被朗读。
 
+## 语音输入契约（说话人前缀）
+
+- voiceprint 启用时，**Voice Service** 在 `asr_result.text` 里按句拼好
+  `[说话人名字 (ID: 编号)] 内容`（多句换行），例如 `[爸爸 (ID: 100)] 打开客厅灯`、
+  `[未知 (ID: 101)] 你好`；是否加前缀与 `voiceprint.enabled` 绑定，格式与规则见
+  `voice_service/PROTOCOL.md` §5。
+- 名字取 `voiceprint.speaker_names`（`spk_100` → 真实姓名），未映射/未识别显示「未知」；
+  编号为声纹库 id 的数字部分（`spk_100` → `100`），同一人跨轮次稳定 —— agent 据此区分说话人。
+- 拼接只在服务端（`voiceprint.speaker_label` + `inbound.py`）完成；gateway 插件与 agent
+  侧**原样透传、不解析不重排**。改动格式需同步插件 `platform_hint` 与 `PROTOCOL.md`。
+
 ## 测试
 
 未配置 pytest / linter / typecheck，均为手工脚本：

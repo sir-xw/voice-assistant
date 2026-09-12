@@ -126,7 +126,7 @@ VAD、TTS、播放队列、连续对话窗口全部由服务端负责。
 | `welcome` | `{ok, my_wakewords, version}` | `hello` 应答（§3） |
 | `ack` | `{seq, ok, error?}` | 每条命令的应答 |
 | `wake_word` | `{keyword, wake}` | 唤醒词命中（服务端已本地播提示音/打断）。两者均为**助手名**（服务端 KWS 词表的 `@` 后缀） |
-| `asr_result` | `{text, wake, message_id, turn_seq}` | 用户一段话识别完成（**主事件**） |
+| `asr_result` | `{text, wake, message_id, turn_seq}` | 用户一段话识别完成（**主事件**）；`text` 见下方说明（声纹启用时含说话人前缀） |
 | `speak_done` | `{id, kind, ok}` | 一段 `speak` 播报完成（`ok=false` 表示 TTS/播放失败） |
 | `pong` | `{}` | `ping` 应答（同 `seq`） |
 | `asr_interim` | `{text, wake}` | **预留，当前不发送**（需 `caps.interim`） |
@@ -137,13 +137,19 @@ VAD、TTS、播放队列、连续对话窗口全部由服务端负责。
 
 ```json
 {"v":1,"type":"asr_result","seq":null,"client_id":"","ts":0,
- "data":{"text":"[爸爸] 今天天气怎么样？","wake":"小布",
+ "data":{"text":"[爸爸 (ID: 100)] 今天天气怎么样？","wake":"小布",
          "message_id":"voice-1710000000123","turn_seq":12}}
 ```
 
 - `wake`：本轮属于哪个助手（你用它做会话路由，例如 `chat_id = "wake:" + wake`）；
 - `turn_seq`：服务端每轮自增的回合号 —— 发 `speak` 时**原样带回**，服务端据此丢弃迟到的旧轮回复；
-- `text`：识别文本；服务端启用声纹时**按句换行并用 `[说话人]` 前缀**标注（如 `"[爸爸] 打开客厅灯"`），客户端无需处理；
+- `text`：识别文本；服务端启用声纹（`voiceprint.enabled`）时**按句换行**，每句带
+  `[说话人名字 (ID: 编号)]` 前缀，例如：
+  `"[爸爸 (ID: 100)] 打开客厅灯\n[未知 (ID: 101)] 你好"`。
+  名字取 `voiceprint.speaker_names`（`spk_100` → 真实姓名）映射，未映射时显示「未知」；
+  编号是声纹库 id 的数字部分（`spk_100` → `100`），同一说话人跨轮次稳定，可用于区分不同人。
+  名字与编号始终成对出现；识别不出且未注册时只有「未知」（无编号）。
+  **客户端把 `text` 原样作为用户消息交给 agent 即可，无需再解析或重排**；
 - `message_id`：`voice-<epoch_ms>`，仅用于日志串联。
 
 ---
@@ -246,7 +252,7 @@ asyncio.run(main())
 | `service.wait_reply_timeout_sec` | `asr_result` 后等待 `speak` 的超时，超时播告别语（默认 45s） |
 | `conversation_window.timeout_sec` | `final` 播完后的连续对话窗口时长 |
 | `wake_word.assistants` | 助手表（`name` = 上行事件里的 `wake`）；服务端据此生成 KWS 词表 |
-| `voiceprint.enabled` | 是否在 `asr_result.text` 中加 `[说话人]` 前缀 |
+| `voiceprint.enabled` | 是否在 `asr_result.text` 中按句加 `[名字 (ID: 编号)]` 前缀 |
 
 ---
 

@@ -148,7 +148,7 @@ hermes gateway 进程 ─────────────► gateway 会话�
 | `wake_word` | KWS 命中（本地已播提示音/打断） | `{keyword, wake, ts}` | 客户端记录「当前活跃助手名」（wake=KWS `@助手名`） |
 | `asr_interim` | ASR 中间结果（需 hello 声明 caps.interim） | `{text, wake}` | 可选，v1 默认关闭 |
 | `asr_sentence` | 每个完成句（voiceprint 开时附带说话人） | `{text, speaker_id?, speaker_label?, start_ms?, end_ms?}` | 供客户端观察/日志 |
-| `asr_result` | VAD 判定整段结束、ASR final（**inbound 主事件**） | `{text, wake, speaker_text?, message_id, turn_seq}` | 客户端据此构造 `MessageEvent` |
+| `asr_result` | VAD 判定整段结束、ASR final（**inbound 主事件**） | `{text, wake, message_id, turn_seq}` | 客户端据此构造 `MessageEvent`；声纹启用时 `text` 已按句带 `[名字 (ID: 编号)]` 前缀 |
 | `speak_done` | 一段/一 final 播报完成 | `{id, kind, ok, error?}` | 供客户端记录「播完」与告警 |
 | `error` | 服务端异常 | `{code, message}` | — |
 | `pong` | ping 应答 | `{}` | — |
@@ -366,7 +366,7 @@ voice_service:
 | 现状（adapter 内） | 迁移至 |
 |---|---|
 | `_init_frontend`（VoiceFrontend 全量配置 + 回调） | `voice_service/inbound.py`：回调改为「发事件」而非「调 hermes」 |
-| `_init_asr` + `_on_asr_start/_on_asr_sentence/_on_asr_complete/_on_asr_error` | `inbound.py`：`on_complete` → 上行 `asr_result`（含 voiceprint 拼好的 `[说话人]` 前缀）；`on_sentence` → 声纹识别（本地）→ 附 label |
+| `_init_asr` + `_on_asr_start/_on_asr_sentence/_on_asr_complete/_on_asr_error` | `inbound.py`：`on_complete` → 上行 `asr_result`（含 voiceprint 拼好的 `[名字 (ID: 编号)]` 前缀）；`on_sentence` → 声纹识别（本地）→ 附 label |
 | `_init_playback` + `_playback_consumer/_play_segments/_play_asset/_wait_tone_*` | `voice_service/playback.py`：队列消费者；`speak` 帧即入队元素 |
 | `_on_interrupt_request`（打断 TTS/清队） | `inbound.py` 本地打断 + `control/interrupt` 帧处理共用同一清理函数 |
 | `_init_voiceprint` | `voice_service` 装配（凭据与模型同在服务侧） |
