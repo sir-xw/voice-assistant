@@ -79,9 +79,13 @@ mcp_servers:
 
 - [x] `coordinator.py`：intent/hold/effective 状态机（含自检）
 - [x] `hold_ipc.py`：Unix socket hold/release/status 服务
-- [x] `mpd_conn.py`：python-mpd2 封装 + 只读查询（currentsong/playlist/search；Dummy 模式）
-- [x] `tools_mcp.py`：MCP server 工具面 —— **web（streamable HTTP）端口**暴露 mpd_* 工具
-      （`--enable-mcp`，需 `[mcp]` extras）
+- [x] `mpd_conn.py`：python-mpd2 封装 + 只读查询（currentsong/playlist/search）+ 播放列表编辑
+      （clear/add；Dummy 模式同接口）
+- [x] `tools_mcp.py`：MCP server 工具面 —— **web（streamable HTTP）端口**暴露 12 个 `mpd_*` 工具
+      （`--enable-mcp`，需 `[mcp]` extras）：
+      `mpd_play` / `mpd_resume` / `mpd_pause` / `mpd_stop` / `mpd_next` / `mpd_previous`（intent）、
+      `mpd_get_status` / `mpd_get_current_song` / `mpd_get_playlist` / `mpd_search`（只读）、
+      `mpd_clear_playlist` / `mpd_add_to_playlist`（播放列表编辑，不改 intent）
 - [x] hermes 侧 MCP 接入联调：`~/.hermes/config.yaml` `mcp_servers.music`
       （`url: http://127.0.0.1:8766/mcp`）→ Agent 以 `mcp__music__mpd_*` 调用音乐控制
 - [x] systemd 部署：`music-coordinator.service`（`python -u -m music_coordinator --enable-mcp`）运行中，

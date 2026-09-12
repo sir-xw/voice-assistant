@@ -98,6 +98,35 @@ class MusicCoordinator:
             self._sync()
         return self.snapshot()
 
+    # ─── 播放列表编辑 API（agent 经 MCP 调用；不改 intent）──
+
+    def clear_playlist(self) -> dict:
+        """清空 MPD 播放列表（不影响播放/暂停意图）。"""
+        if self.backend is None:
+            return {"ok": False, "error": "无 MPD 后端"}
+        try:
+            self.backend.clear_playlist()
+        except Exception as exc:
+            logger.warning("[mc] 清空播放列表失败: %s", exc)
+            return {"ok": False, "error": str(exc)}
+        logger.info("[mc] 播放列表已清空")
+        return self.snapshot()
+
+    def add_to_playlist(self, uri: str) -> dict:
+        """把音乐库条目（文件/目录 uri）追加到播放列表。"""
+        uri = (uri or "").strip()
+        if not uri:
+            return {"ok": False, "error": "缺少 uri（可用 mpd_search 返回的 file 字段）"}
+        if self.backend is None:
+            return {"ok": False, "error": "无 MPD 后端"}
+        try:
+            self.backend.add_to_playlist(uri)
+        except Exception as exc:
+            logger.warning("[mc] 追加播放列表失败: %s", exc)
+            return {"ok": False, "error": str(exc)}
+        logger.info("[mc] 播放列表 + %s", uri)
+        return self.snapshot()
+
     # ─── hold API（Voice Service 经 Unix socket 调用）────
 
     def hold(self, reason: str = "tts") -> None:
@@ -208,6 +237,15 @@ def _selftest() -> None:
     assert ("transport", "next") in mpd.ops
     assert mc.intent == Intent.PLAYING
     assert mpd.ops[-1] == ("apply", "playing")
+
+    # 7) 播放列表编辑：直接写 MPD，不改 intent
+    mc.clear_playlist()
+    assert ("playlist", "clear") in mpd.ops
+    before_intent = mc.intent
+    mc.add_to_playlist("song.mp3")
+    assert ("playlist", "add:song.mp3") in mpd.ops
+    assert mc.intent == before_intent
+    assert mc.add_to_playlist("")["ok"] is False          # 空 uri 拒绝
 
     print(f"[music_coordinator.coordinator] 自检通过 ✅（MPD 操作序列 {len(mpd.ops)} 条）")
 

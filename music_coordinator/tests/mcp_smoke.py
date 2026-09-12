@@ -26,7 +26,9 @@ async def main(url: str) -> int:
             names = [t.name for t in tools.tools]
             print(">>> 可用工具:", names)
             for want in ("mpd_play", "mpd_pause", "mpd_stop", "mpd_next",
-                         "mpd_previous", "mpd_get_status"):
+                         "mpd_previous", "mpd_get_status", "mpd_get_current_song",
+                         "mpd_get_playlist", "mpd_search",
+                         "mpd_clear_playlist", "mpd_add_to_playlist"):
                 assert want in names, f"缺少工具 {want}"
 
             print(">>> mpd_pause:", (await session.call_tool("mpd_pause", {})))
@@ -34,6 +36,10 @@ async def main(url: str) -> int:
             print(">>> mpd_next:", (await session.call_tool("mpd_next", {})))
             print(">>> mpd_resume:", (await session.call_tool("mpd_resume", {})))
             print(">>> mpd_get_playlist:", (await session.call_tool("mpd_get_playlist", {})))
+            print(">>> mpd_add_to_playlist:",
+                  (await session.call_tool("mpd_add_to_playlist", {"uri": "dummy.mp3"})))
+            print(">>> mpd_clear_playlist:",
+                  (await session.call_tool("mpd_clear_playlist", {})))
             print(">>> MCP 冒烟通过 ✅")
     return 0
 

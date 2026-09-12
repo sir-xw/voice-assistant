@@ -112,6 +112,18 @@ def build_mcp_server(coordinator: MusicCoordinator, *, host: str = "127.0.0.1",
             return {"ok": False, "error": "请提供至少一个搜索条件"}
         return {"ok": True, "songs": backend.search(filters)}
 
+    # ─── 播放列表编辑类（写 MPD，不改 intent）────────────
+
+    @mcp.tool()
+    def mpd_clear_playlist() -> Dict[str, Any]:
+        """清空当前播放列表（不影响播放/暂停意图）。"""
+        return coordinator.clear_playlist()
+
+    @mcp.tool()
+    def mpd_add_to_playlist(uri: str) -> Dict[str, Any]:
+        """把音乐库条目追加到播放列表；uri 用 mpd_search 返回的 file 字段。"""
+        return coordinator.add_to_playlist(uri)
+
     return mcp
 
 

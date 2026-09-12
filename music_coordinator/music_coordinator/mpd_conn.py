@@ -113,6 +113,16 @@ class RealMpd(MpdBackend):
             logger.warning("[mc] MPD search 失败: %s", exc)
             return []
 
+    # ─── 播放列表编辑（供 MCP 工具；异常向上抛由协调器回报）──
+
+    def clear_playlist(self) -> None:
+        self._with_client(lambda client: client.clear())
+        logger.info("[mc] MPD 播放列表已清空")
+
+    def add_to_playlist(self, uri: str) -> None:
+        self._with_client(lambda client: client.add(uri))
+        logger.info("[mc] MPD 播放列表 + %s", uri)
+
 
 def _format_song(song: dict) -> dict:
     """格式化歌曲信息，只保留关键字段（同旧 mpd_tool._format_song）。"""
@@ -153,3 +163,11 @@ class DummyMpd(MpdBackend):
 
     def search(self, filters: dict) -> List[dict]:
         return [self.currentsong()]
+
+    # ─── 播放列表编辑（Dummy：只记录）────────────────────
+
+    def clear_playlist(self) -> None:
+        self.ops.append(("playlist", "clear"))
+
+    def add_to_playlist(self, uri: str) -> None:
+        self.ops.append(("playlist", f"add:{uri}"))
