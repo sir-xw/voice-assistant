@@ -2,11 +2,14 @@
 播报队列消费者（outbound，M3）。
 
 消费 speak/asset 两类任务，串行出声：
-- speak（interim/final/raw）：逐段按情绪经腾讯云 TTS 流式合成 → AudioPlayer 播放；
-  final 播完 → 通知音 → 进入连续对话窗口；interim 播完若仍在等待回复 → 恢复等待音；
+- speak：逐段按情绪经腾讯云 TTS 流式合成 → AudioPlayer 播放。
+  **kind 区分（2026-09 修订）**：
+  - final/raw（最终回答）：播完 → 通知音 → 进入连续对话窗口；
+  - interim（中间轮文字，如工具轮）：播完若仍在等待最终回复 → 恢复等待音与
+    回复超时兜底；**不进对话窗口、不播通知音、不误播 farewell**。
 - asset：提示音/通知音/告别语 wav 播放（不入 TTS）；
-- 等待音：ASR 结果上行后循环播放（提示"不再收听"），首个 speak 到达即停；
-  无回复超时（wait_reply_timeout_sec）→ 告别语收尾；
+- 等待音：ASR 结果上行后循环播放（提示"不再收听"），首个 speak 到达即暂停；
+  interim 播完恢复；无回复超时（wait_reply_timeout_sec）→ 告别语收尾；
 - 旧轮兜底：speak 带 turn_seq，小于已消费回合的迟到帧被丢弃（防被打断的旧回复播出来）。
 
 音乐避让：每次 TTS/等待音出声前经 MusicHoldClient 通知协调器 hold，
@@ -230,8 +233,15 @@ class Playback:
         await self._stop_wait_tone()
         await self._play_asset("farewell")
 
-    async def _stop_wait_tone(self) -> None:
-        self._waiting = 0
+    async def _stop_wait_tone(self, *, reset_waiting: bool = True) -> None:
+        """停止等待音与回复超时兜底。
+
+        reset_waiting=True：整轮等待结束（final 播报/打断/关窗）——等待计数清零；
+        reset_waiting=False：interim 播报前的"暂停"——保留等待计数，
+        播完由 _handle 按需恢复等待（_start_wait_tone）。
+        """
+        if reset_waiting:
+            self._waiting = 0
         for attr in ("_wait_task", "_wait_timeout_task"):
             task = getattr(self, attr)
             if task is not None:
@@ -282,25 +292,35 @@ class Playback:
         if job["type"] == "asset":
             await self._play_asset(job["name"])
             return
-        # speak：统一按「回合回复文本」处理 —— 不区分 final/interim。
-        # 播报方式（通知音/进对话窗口 vs 保持等待）由本服务的会话状态决定
-        # （有内容可念 = 用户当前这轮的回答，播完即通知音 + 连续对话窗口）。
+        # speak：恢复 kind 区分（2026-09 修订）——
+        #   final（或 raw，视为最终回答）：播完 → 通知音 + 进入连续对话窗口；
+        #   interim（中间轮，如工具轮文字）：播完 → 若仍在等最终回复则**恢复等待
+        #     状态**（重新起等待音与回复超时兜底），不进对话窗口、不播通知音、
+        #     不因窗口超时误播 farewell（告别语只属于"整轮无回复超时"与"窗口
+        #     超时未续话"两个真实收尾场景）。
         self._interrupted = False
-        await self._stop_wait_tone()      # 开始播报：停等待音
-
-        kind = job.get("kind")
+        kind = job.get("kind") or P.SPEAK_FINAL
         segments = job.get("segments") or []
         texts = [t for _, t in segments if t and t.strip()]
+
+        is_final = kind in (P.SPEAK_FINAL, P.SPEAK_RAW)
+        # 播报期间是否需要保持"仍在等待最终回复"的语义（仅 interim 场景）
+        keep_waiting = not is_final and self._waiting > 0
+
+        # 开始播报：interim 只暂停等待音/超时计时（保留等待计数），
+        # final 则结束本轮等待（计数清零，之后走通知音+对话窗口）。
+        await self._stop_wait_tone(reset_waiting=is_final)
+
         ok = True
         if texts:
             self._playing = True
             try:
                 if self.silent or self._tts is None or self._player is None:
-                    logger.info("[playback] 🔊 播报(silent, %s): %d 段",
-                                job.get("wake"), len(texts))
+                    logger.info("[playback] 🔊 播报(silent, %s, %s): %d 段",
+                                job.get("wake"), kind, len(texts))
                 else:
-                    logger.info("[playback] 🔊 播报(%s): %d 段",
-                                job.get("wake"), len(texts))
+                    logger.info("[playback] 🔊 播报(%s, %s): %d 段",
+                                job.get("wake"), kind, len(texts))
                     ok = await asyncio.to_thread(
                         self._play_tts_sync, job.get("id"), segments)
             finally:
@@ -311,9 +331,19 @@ class Playback:
             "id": job.get("id", ""), "kind": kind, "ok": ok})
 
         if not ok or self._interrupted or not texts:
+            # 播报失败/被打断/空文本：interim 场景仍在等待最终回复 → 恢复等待音，
+            # 避免"播了个空/失败中间轮"后用户陷入无提示的静默等待。
+            if keep_waiting:
+                await self._start_wait_tone()
             return
 
-        # 播完本轮回答：通知音 + 进入连续对话窗口（用户可直接接着说，无需再唤醒）
+        if not is_final:
+            # 中间轮播完：仍在等最终回复 → 恢复等待音 + 回复超时兜底
+            if keep_waiting:
+                await self._start_wait_tone()
+            return
+
+        # 最终轮播完：通知音 + 进入连续对话窗口（用户可直接接着说，无需再唤醒）
         await self._play_asset("notification")
         frontend = self.get_frontend()
         if frontend is not None:

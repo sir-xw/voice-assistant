@@ -53,10 +53,11 @@ EVT_SPEAK_DONE = "speak_done"    # 一段/一 final 播报完成
 EVT_ERROR = "error"
 EVT_PONG = "pong"
 
-# speak.kind：播报类别（**兼容字段** —— v1.1 起 Voice Service 不据此分支）
-# 播报方式由 Voice Service 按自身会话状态决定：任何有内容的 speak 播完后
-# 都会通知音 + 进入连续对话窗口。客户端（hermes_gateway_plugin）统一发送
-# "final"。常量保留兼容旧客户端与日志/调试。
+# speak.kind：播报类别（2026-09 恢复区分语义，服务端据此决定播后行为）
+# - "final"（最终回答，含 raw 兼容）：播完 → 通知音 → 进入连续对话窗口；
+# - "interim"（中间轮文字，如工具轮）：播完若仍在等最终回复 → 恢复等待音，
+#   不播通知音、不进对话窗口、不误触发 farewell。
+# 客户端（hermes_gateway_plugin）：finish_reason=stop → final，其余 → interim。
 SPEAK_FINAL = "final"
 SPEAK_INTERIM = "interim"
 SPEAK_RAW = "raw"
