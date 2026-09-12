@@ -16,8 +16,8 @@
 | `music_coordinator/` | MPD 唯一写入口（intent/hold 状态机）：hold IPC 供 Voice Service 播报避让，MCP(web) 供 agent 音乐工具 | ❌ |
 
 - 其他目录：`docs/`（架构设计：`voice-service-websocket-architecture.md`）、
-  `deploy/systemd/`（hermes-gateway 单元模板）、`hermes-voice-agent/`（**旧实现，已冻结**，
-  仅作素材/历史参考，勿在此开发）。
+  `deploy/systemd/`（hermes-gateway 单元模板）。旧单体实现 `hermes-voice-agent/`
+  已于 2026-09 删除：可复用的组件/工具已迁入 `voice_service/`，历史见 git log。
 - 接入协议见 `voice_service/PROTOCOL.md`；协议常量以 `voice_service/voice_service/protocol.py`
   为准（两端共用、零第三方依赖，改动需同步 `hermes_gateway_plugin`）。
 - 注释、文档、代码字符串均为中文 —— 请保持中文。
@@ -77,6 +77,10 @@
   回复 → `speak` 帧（`finish_reason=stop` → `final`，其余 → `interim`），`send()` 仅兜底。
 - 播后行为：`final` → 通知音 + 进入连续对话窗口；`interim` → 回到等待（不通知音、不进窗口）。
   「不需要朗读」时客户端发 `control{close_window}`（hermes 插件里 `[FINISH]` 即此语义）。
+- **被打断会话的回复**：用户在助手 A 思考/调工具期间唤醒 B 时，插件按 `session_id` 惰性归属回复
+  （`_wake_for_hook`），保证 A 的迟到回复仍标记为 A；服务端据此**丢弃 A 的 interim**、把 A 的
+  final **排队并加「我是A，」前缀**。改动归属/播报语义时需同时改插件与 playback，并同步
+  `voice_service/PROTOCOL.md`。
 - `post_api_request` 是 hermes **全局 observer 钩子**，必须按 `platform == "voice"` 过滤来源
   （已实现，勿移除），否则 CLI 等会话的回复也会被朗读。
 
@@ -87,9 +91,14 @@
 - 协议自检：`python -m voice_service --selfcheck`（等价 `protocol._selftest()`）
 - 音乐协调器：`python -m music_coordinator --dummy-mpd`（Dummy MPD，避免影响真实 MPD）；
   `python -u music_coordinator/tests/mcp_smoke.py`
+- 语音调试工具（`voice_service/tests/`，在 `voice_service/` 下运行）：
+  `test_sherpa_asr.py`、`test_sensevoice_asr.py`（本地 ASR）、`test_sherpa_kws.py`、
+  `test_sherpa_tts.py`、`test_tencent_asr.py`（云端 ASR）、`test_speaker_identify.py`、
+  `test_voiceprint_live.py`（说话人/声纹；`tests/4spk.wav` 用于对比模型分离效果）
+- 语音工具（`voice_service/tools/`）：`download_models.py`（按配置下载模型到 `models/`）、
+  `tts_gen.py`（腾讯云 TTS 生成提示音资产）
 - 握手/联调：临时起 `voice_service`（覆盖端口、不带 `--audio`）用 WS 客户端验证
   `hello/welcome`、`speak/ack`；参考 `voice_service/PROTOCOL.md` 的最小示例
-- 旧 `hermes-voice-agent/tests/` 属 v1 遗留（`import voice_agent`，已退役），仅在需要素材时参考
 
 ## 提交规范（约定式提交）
 
@@ -105,7 +114,6 @@
 - **兼容性**：改动协议/配置格式等破坏性变更时，在正文显式标注。
 - **不要提交**：`voice_service/config.yaml`、`.env`、`models/`、日志与运行产物、本机绝对路径类
   配置（模板/示例除外）。
-- **不要动**：`hermes-voice-agent/voice_agent/` 是冻结的旧实现，勿在其中开发或顺带提交其改动。
 - 示例：
   - `feat(voice-service): 恢复 speak kind 区分——interim 播完回到等待`
   - `fix(voice): post_api_request 钩子按 platform=voice 过滤来源`

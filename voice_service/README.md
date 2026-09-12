@@ -13,7 +13,7 @@ python -m voice_service --config config.yaml
 ```
 
 组件代码（`vad.py`/`voice_frontend.py`/`asr_engine.py`/`tts_engine.py`/`audio_player.py`/
-`voiceprint.py`/`tencentcloud_speech/`）复制自旧 `hermes-voice-agent/voice_agent/`，
+`voiceprint.py`/`tencentcloud_speech/`）复制自旧实现（原 `hermes-voice-agent/voice_agent/`，该目录已删除），
 运行时不 import 旧包；vendored 腾讯云 SDK 随本包分发。
 
 ## 接入其他 agent
@@ -24,6 +24,24 @@ python -m voice_service --config config.yaml
 协议契约代码见 `voice_service/protocol.py`（零第三方依赖，可直接复制到客户端；
 `hermes_gateway_plugin` 即复用同一模块）。详细架构设计见
 `docs/voice-service-websocket-architecture.md`。
+
+## 调试工具（`tests/` 与 `tools/`）
+
+均为手工脚本，在 `voice_service/` 目录下运行（`voice_service` 已 editable 安装）：
+
+- **本地 ASR**：`python -u tests/test_sherpa_asr.py --help`（流式 zipformer）、
+  `tests/test_sensevoice_asr.py --help`（SenseVoice，含 CAM++ 说话人对照）；
+  首次运行会自动下载模型到 `models/sherpa-asr/`
+- **唤醒词 / 本地 TTS**：`tests/test_sherpa_kws.py --help`、`tests/test_sherpa_tts.py --help`
+- **声纹 / 说话人**：`tests/test_speaker_identify.py --help`（说话人分离 + 声纹库对照，
+  用 `tests/4spk.wav` 对比不同模型的分离效果）、`tests/test_voiceprint_live.py --help`
+  （空库首次运行自动注册新说话人，`--reuse` 复用特征库）
+- **云端 ASR**：`tests/test_tencent_asr.py --help`（读 `.env` 凭据 + `config.yaml` 默认值；
+  `--sine 3` 可无麦克风验证）
+- **模型下载**：`python -u tools/download_models.py [--check|--force]`
+  （按 `config.yaml` 的 `kws.model_name` / `models.*` 下载到 `models/`）
+- **提示音生成**：`python -u tools/tts_gen.py --text "你好" --output prompt.wav`
+  （腾讯云 TTS 生成资产 wav，便于更换音色）
 
 ## 部署（systemd user 服务，本机实测）
 
