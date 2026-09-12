@@ -6,47 +6,114 @@
 
 ## 仓库结构
 
-- 真正的项目代码位于 `hermes-voice-agent/` 目录下。仓库根目录的文件（`API-DOCS/`、`*.wav`、`hermes-voice-agent-deploy.txt`、根目录 `.env`）是部署笔记/产物，不是应用代码。请在 `hermes-voice-agent/` 内工作。
-- 这是 **Hermes Agent 框架的语音前端**：唤醒词 → VAD → 腾讯云 ASR → Hermes Agent → 腾讯云 TTS。
+语音能力已从旧的单体内嵌实现（`hermes-voice-agent/`）拆分为**三个平级、自包含的子项目**
+（各有独立 `pyproject.toml`，可分别安装到不同 venv）：
+
+| 目录 | 角色 | 依赖 hermes |
+|---|---|---|
+| `voice_service/` | 独立语音服务（WS **服务端**）：麦克风 / 唤醒词 / VAD / 腾讯云 ASR-TTS / 播放队列 / 连续对话窗口；**唤醒词↔助手映射的唯一源** | ❌ |
+| `hermes_gateway_plugin/` | hermes gateway 的 voice 平台插件（WS **客户端**）：识别结果 → 会话；回复文本 → 下发朗读 | ✅（唯一） |
+| `music_coordinator/` | MPD 唯一写入口（intent/hold 状态机）：hold IPC 供 Voice Service 播报避让，MCP(web) 供 agent 音乐工具 | ❌ |
+
+- 其他目录：`docs/`（架构设计：`voice-service-websocket-architecture.md`）、
+  `deploy/systemd/`（hermes-gateway 单元模板）、`hermes-voice-agent/`（**旧实现，已冻结**，
+  仅作素材/历史参考，勿在此开发）。
+- 接入协议见 `voice_service/PROTOCOL.md`；协议常量以 `voice_service/voice_service/protocol.py`
+  为准（两端共用、零第三方依赖，改动需同步 `hermes_gateway_plugin`）。
 - 注释、文档、代码字符串均为中文 —— 请保持中文。
+- **USB 音频设备运维属本机环境特定内容，已移出仓库**（`/root/usb-audio/`：修复脚本、健康
+  检测、音量服务与其 systemd 单元，见该目录 README）。不要把它们加回本仓库。
 
 ## 运行环境（关键）
 
-- **仓库内没有 venv。** 所有运行都依赖 Hermes Agent 安装自带的虚拟环境：
-  `/usr/local/lib/hermes-agent/venv/bin/python3`（Python 3.11）。`pip install` 也装到那里。
-- `AIAgent`（`from run_agent import AIAgent`）和 `from tools.registry import registry` **都从 `/usr/local/lib/hermes-agent/` 导入，不在本仓库内**。本仓库只提供工具处理函数和应用装配。不要试图在仓库内改动它们。
-- 腾讯云语音 SDK 是 **vendored 在 `voice_agent/tencentcloud_speech/`** 的 —— 直接改那里的代码；它不是 pip 依赖。
-- 在 `hermes-voice-agent/` 目录下运行：`python -u -m voice_agent`（入口在 `voice_agent/__main__.py`）。**cwd 很关键**：sherpa 模型和 `keywords.txt` 都按项目根目录的相对路径解析。
-- **`voice_agent` 是可编辑安装的包**：首次使用需 `python -m pip install -e .`（`pyproject.toml`，装进 hermes venv）。之后 `from voice_agent.xxx import ...` 全项目可用（vendored SDK 写作 `from voice_agent.tencentcloud_speech...`），**任何脚本都无需 sys.path hack**。改代码即生效，无需重装；`run_agent` / `tools.registry` 来自已安装的 hermes-agent，保持顶层导入。
-- 通过 systemd 部署：`services/hermes-voice-agent.service`（用户 `root`，`WorkingDirectory=/root/git/voice-assistant/hermes-voice-agent`）。改代码后：`systemctl restart hermes-voice-agent`；日志：`journalctl -u hermes-voice-agent -f`。还有一个配套的 `hermes-voice-agent-volume.service` 负责 USB 音量。
+- **仓库内没有 venv。** 依赖 hermes 自带 venv：`/usr/local/lib/hermes-agent/venv/bin/python3`
+  （Python 3.11）；`pip install` 也装到那里。
+- hermes-agent 源码在 `/root/git/hermes-agent`（已 editable 安装）—— **不要修改**；本仓库只提供
+  语音侧代码与 gateway 插件装配。
+- 三个子包均为可编辑安装（改代码即生效）：
+  `pip install -e ./voice_service -e ./hermes_gateway_plugin -e "./music_coordinator[mcp]"`
+  （`hermes_gateway_plugin` 依赖 `voice_service` 的 `protocol.py`，须同 venv）。
+- 腾讯云语音 SDK **vendored** 在 `voice_service/voice_service/tencentcloud_speech/`，不是 pip 依赖。
+- 运行 Voice Service：在 `voice_service/` 目录下 `python -u -m voice_service --config config.yaml
+  [--audio] [--out]`。**cwd 很关键**：模型与 KWS 词表按 `voice_service/` 相对路径解析
+  （`models/sherpa-kws/<model_name>/`）。
+- 部署为 systemd **用户服务**（root + `XDG_RUNTIME_DIR=/run/user/0`）：
+  `voice-service.service`（`--audio --out --config config.yaml`）、`music-coordinator.service`
+  （`--enable-mcp`）、`hermes-gateway.service`（hermes 自身）。单元定义见各子项目 README
+  （仓库 `deploy/systemd/` 只含 hermes-gateway 模板）。
+  改代码后 `systemctl --user restart voice-service`；日志 `journalctl --user -u voice-service -f`
+  （gateway 另有 `~/.hermes/logs/{gateway,agent}.log`）。
+- Voice Service 先于/后于 gateway 启动都可以：gateway 只是 WS 客户端，断线自动重连；
+  **重启 voice-service 不需要重启 gateway**。
 
 ## 配置
 
-- `config.yaml` + `.env`（腾讯云凭据 `VOICE_SecretId`、`VOICE_SecretKey`、`VOICE_AppId`；已 gitignore）。优先级：环境变量 > yaml > 默认值（见 `voice_agent/config.py`；环境变量落入 `tencent` 键下）。
-- `models/`、`.env`、`*.log`、`*.wav`、`*.pyc` 已被 gitignore —— 全新克隆需要先有 KWS 模型和 `.env` 才能跑起来。
+- Voice Service 自身配置：`voice_service/config.yaml`（**gitignore，不入库**；模板
+  `config.yaml.example` 入库，部署时 `cp config.yaml.example config.yaml`）；凭据
+  `voice_service/.env`（`VOICE_SecretId/Key/AppId`，gitignore）；模型 `voice_service/models/`
+  （gitignore）。
+- hermes 侧只配连接参数：`~/.hermes/config.yaml` 的 `platforms.voice.extra.service`
+  （`url`/`token`）。**不再配置 wakewords**；如需按助手覆盖 prompt/model，用 hermes 原生
+  `channel_overrides`（键 `wake:<助手名>`）。
+- 音乐 MCP：`~/.hermes/config.yaml` 的 `mcp_servers.music`（`url: http://127.0.0.1:8766/mcp`）。
+- gitignore 覆盖 `*.log`/`*.wav`/`.env`/`models/`/`__pycache__`/`.venvs/` 等；包内提示音
+  `voice_service/voice_service/assets/*.wav` 需入库（已有豁免规则）。
 
-## 多 Agent 与唤醒词
+## 唤醒词与助手
 
-- `config.yaml` 中每个 `agents[].name` 都是一个唤醒词；它必须与 `models/sherpa-kws/<model>/raw_keywords.txt` 里的 `@original` 标记一致。修改唤醒词后执行 `python -u tools/gen_keywords.py` 重新生成 `keywords.txt`。
-- 每个 agent 可配置 `model`（如 `deepseek-v4-flash`）与 `provider`（如 `deepseek`，否则 hermes 日志显示 provider=unknown；base_url 仍会按凭据自动路由）。`api_mode` / `base_url` 直接写入本仓库 `config.yaml` 的 `agents[]`（如 `codex_responses` + `https://api.deepseek.com`）。
-- 每个 Agent 拥有独立的 `ThreadPoolExecutor`、`session_id` 和代际计数器，代际用于打断时使进行中的结果失效（见 `voice_agent/main.py` 的 `_on_wake_word`、`_ask_agent`）。
+- 唤醒词↔助手映射的**唯一源**：`voice_service/config.yaml` 的 `wake_word.assistants`
+  （`name` = 助手名，`keywords` = 触发短语）。Voice Service 启动时由 `kws_words.py`
+  生成/校验 `models/sherpa-kws/<model>/keywords.txt`；命中后上行事件的 `wake`（KWS `@` 后缀）
+  即助手名，gateway 用它拼 `chat_id = wake:<助手名>`。
+- 修改后重启 `voice-service` 即生效；hermes 侧无需改动（`hello` 不再上报词表，
+  `welcome.my_wakewords` 回显服务端实际助手表）。
+- 旧 `hermes-voice-agent/tools/gen_keywords.py` 已退役，勿再使用。
 
-## AI 输出契约（由 `voice_agent/main.py` 中的系统提示词强制）
+## AI 输出契约
 
-- 阶段性进展只能用 `speak` 工具播报。最终回答必须以 `(情绪)文字` 格式返回，情绪取自固定集合（neutral/sad/happy/angry/.../jieshuo）。**一段回复可以包含多个情绪标记分段**：各段按对应情绪**流式实时合成播放**，前一段播完自然续播后一段，全部播完后才播通知音并进入对话窗口。播放控制类工具（`mpd_*`）直接返回字面量 `[FINISH]`。
-- 不要孤立地改动这个契约 —— `main.py`（`_parse_emotion_segments` 的情绪集合）与 `speak` 的 schema 必须保持一致。
+- 服务端按 `(情绪)文字` 解析分段并流式合成播放；情绪集合与 `voice_service/protocol.py` 的
+  `VALID_EMOTIONS`、`parse_emotion_segments` 必须一致，勿孤立修改。
+- **没有 `speak` 工具**：模型正常返回文本即可。gateway 插件用 `post_api_request` 钩子捕获每轮
+  回复 → `speak` 帧（`finish_reason=stop` → `final`，其余 → `interim`），`send()` 仅兜底。
+- 播后行为：`final` → 通知音 + 进入连续对话窗口；`interim` → 回到等待（不通知音、不进窗口）。
+  「不需要朗读」时客户端发 `control{close_window}`（hermes 插件里 `[FINISH]` 即此语义）。
+- `post_api_request` 是 hermes **全局 observer 钩子**，必须按 `platform == "voice"` 过滤来源
+  （已实现，勿移除），否则 CLI 等会话的回复也会被朗读。
 
 ## 测试
 
-- 未配置 pytest / linter / typecheck。测试是手工脚本，从 `hermes-voice-agent/` 目录直接运行（`voice_agent` 已 `pip install -e .`，无需 sys.path hack）：
-  - `python -u tests/test_sherpa_asr.py --help`
-  - `python -u tests/test_sensevoice_asr.py --help`
-  - `python -u tests/test_tencent_asr.py --help`
-  - `python -u tests/test_agent_tools.py`
-  - `python -u tests/test_speaker_identify.py --help`  # 说话人分离 + 声纹库对照（--segment tencent 默认）
-  - `python -u tests/test_voiceprint_live.py`          # 说话人识别集成模拟（空库首次运行，自动注册新说话人）
-  - `python -u tests/test_voiceprint_live.py --reuse`  # 复用特征库，验证持久化加载与命中
-- 大部分测试需要真实的腾讯云凭据 + 可用的麦克风；sherpa 测试会自动下载模型。`python -u tests/test_tencent_asr.py --sine 3` 可无麦克风验证 ASR。`python -u tests/test_agent_tools.py` 通过真实的 hermes-agent registry 测试工具。
+未配置 pytest / linter / typecheck，均为手工脚本：
+
+- 协议自检：`python -m voice_service --selfcheck`（等价 `protocol._selftest()`）
+- 音乐协调器：`python -m music_coordinator --dummy-mpd`（Dummy MPD，避免影响真实 MPD）；
+  `python -u music_coordinator/tests/mcp_smoke.py`
+- 握手/联调：临时起 `voice_service`（覆盖端口、不带 `--audio`）用 WS 客户端验证
+  `hello/welcome`、`speak/ack`；参考 `voice_service/PROTOCOL.md` 的最小示例
+- 旧 `hermes-voice-agent/tests/` 属 v1 遗留（`import voice_agent`，已退役），仅在需要素材时参考
+
+## 提交规范（约定式提交）
+
+格式：`<type>(<scope>): <中文简述>`（首行 ≤ 72 字符，末尾不加句号）；空行后用中文正文说明
+**为什么改**与影响、取舍。
+
+- **type**：`feat` 新功能 / `fix` 修缺陷 / `refactor` 重构（行为不变）/ `docs` 文档 /
+  `test` 测试 / `chore` 杂项（构建、依赖、配置）/ `perf` 性能。
+- **scope**：受影响对象，如 `voice-service`、`voice`（hermes 插件）、`music`、`protocol`、
+  `docs`、`deploy`。
+- **粒度**：一个提交只做一件事；按内容拆分为多个独立提交；三个子包的**同一主题**改动可合并为
+  一次提交（例：三子包拆分）。
+- **兼容性**：改动协议/配置格式等破坏性变更时，在正文显式标注。
+- **不要提交**：`voice_service/config.yaml`、`.env`、`models/`、日志与运行产物、本机绝对路径类
+  配置（模板/示例除外）。
+- **不要动**：`hermes-voice-agent/voice_agent/` 是冻结的旧实现，勿在其中开发或顺带提交其改动。
+- 示例：
+  - `feat(voice-service): 恢复 speak kind 区分——interim 播完回到等待`
+  - `fix(voice): post_api_request 钩子按 platform=voice 过滤来源`
+  - `docs(voice-service): 新增面向其他 agent 的 WebSocket 协议说明`
+  - `refactor: 新架构文件归位（文档→docs/、gateway 单元→deploy/）`
 
 ## 当前状态
 
+- 新架构已部署运行：`voice-service` / `music-coordinator` / `hermes-gateway` 均为 systemd
+  用户服务，语音全链路（唤醒 → ASR → agent → TTS 播报 → 连续对话 → 音乐避让）可用。
+- 迁移里程碑 M0–M4 已完成；M1 的 hub/session 多连接仍为 v1 单客户端（既定取舍）。
