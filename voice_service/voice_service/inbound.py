@@ -6,7 +6,8 @@
 
 - KWS 命中 → 上行 `wake_word`（本地提示音/打断行为在 M3 playback 接入前占位）
 - ASR 整段完成 → 上行 `asr_result`（voiceprint 启用时文本按句带
-  `[名字 (ID: 编号)]` 前缀，格式见 PROTOCOL.md §5）
+  `[名字 (ID: 编号)]` 前缀 + 结构化 `speakers`，格式见 PROTOCOL.md §5）
+- 同一轮结果写入对话历史日志（`chat_log.py`），供人工维护说话人身份
 - 本地回合号 `turn_seq` 随 asr_result 上行，客户端用它标记 speak 归属轮次
 
 硬件与模型路径约定：模型/关键词默认相对 **voice_service 子项目根**
@@ -40,10 +41,11 @@ class Inbound:
     """语音输入装配：构造 ASR/VoiceFrontend/voiceprint 并把事件上行到 server。"""
 
     def __init__(self, cfg: VoiceServiceConfig, server: VoiceServer,
-                 playback=None):
+                 playback=None, chat_log=None):
         self.cfg = cfg
         self.server = server
         self.playback = playback      # Playback | None（M3：回调接播报）
+        self.chat_log = chat_log       # ChatLog | None（对话历史，人工维护身份用）
         self.asr = None            # TencentCloudASREngine
         self.frontend = None       # VoiceFrontend
         self.voiceprint = None     # VoiceprintManager | None
@@ -52,7 +54,6 @@ class Inbound:
         # voiceprint 辅助（与旧 adapter 一致）
         self._vp_round: list = []
         self._vp_id_cache: dict = {}
-        self._vp_auto_register = True
         self._vp_min_register_sec = 1.5
         self._vp_use_cache = True
 
@@ -92,6 +93,10 @@ class Inbound:
     def _init_voiceprint(self, vp_cfg: dict) -> None:
         from .voiceprint import VoiceprintManager
         try:
+            if "auto_register" in vp_cfg:
+                logger.warning(
+                    "[inbound] auto_register 配置项已取消：启用说话人识别即始终自动注册"
+                    "（身份绑定需要编号锚点），请从 config.yaml 删除该行")
             lib_dir = vp_cfg.get("lib_dir") or "models/voiceprint_lib"
             p = Path(lib_dir)
             if not p.is_absolute():
@@ -101,14 +106,14 @@ class Inbound:
                 threshold=float(vp_cfg.get("threshold", 0.6)),
                 speaker_names=vp_cfg.get("speaker_names") or {},
             )
-            self._vp_auto_register = bool(vp_cfg.get("auto_register", True))
             self._vp_min_register_sec = float(vp_cfg.get("min_register_sec", 1.5))
             self._vp_use_cache = bool(vp_cfg.get("speaker_id_cache", True))
             if self.voiceprint.extractor is None:
                 logger.warning("[inbound] 声纹模型不可用，说话人识别降级")
                 self.voiceprint = None
             else:
-                logger.info("[inbound] 说话人识别已启用（特征库: %s）", p)
+                logger.info("[inbound] 说话人识别已启用（特征库: %s，绑定: %s）",
+                            p, self.voiceprint.aliases.path)
         except Exception as exc:
             logger.warning("[inbound] voiceprint 初始化失败（降级）: %s", exc)
             self.voiceprint = None
@@ -223,7 +228,11 @@ class Inbound:
         self._vp_id_cache.clear()
 
     def _on_asr_sentence(self, info: dict) -> None:
-        """腾讯云每完成一个句子 → 本地声纹识别（voiceprint 旁路）。"""
+        """腾讯云每完成一个句子 → 本地声纹识别（voiceprint 旁路）。
+
+        `_vp_round` 元素为 `(spk_id, label, text)`：spk_id 供 asr_result.speakers
+        与身份绑定用，label 是 agent 看到的 `名字 (ID: 编号)`。
+        """
         if self.voiceprint is None or self.asr is None:
             return
         text = (info.get("text") or "").strip()
@@ -234,27 +243,25 @@ class Inbound:
             if self._vp_use_cache and tx_spk in self._vp_id_cache:
                 spk_id, score = self._vp_id_cache[tx_spk]
                 self._vp_round.append(
-                    (self.voiceprint.speaker_label(spk_id), text))
+                    (spk_id, self.voiceprint.speaker_label(spk_id), text))
                 return
             samples = self.asr.get_sentence_audio(info)
             if samples is None or len(samples) == 0:
                 return
             spk_id, score = self.voiceprint.identify(samples)
             if spk_id is None:
-                if (self._vp_auto_register
-                        and len(samples) / 16000 >= self._vp_min_register_sec):
-                    new_id = self.voiceprint.register(samples)
-                    spk_id = new_id if new_id else None
-            # 未识别（含注册失败）→「未知」；自动注册但未映射 →「未知 (ID: 1xx)」，
-            # 编号稳定，agent 仍能区分不同陌生人
-            self._vp_round.append((self.voiceprint.speaker_label(spk_id), text))
+                # 始终自动注册：身份绑定以编号为锚点，不分配编号就没法关联身份
+                if len(samples) / 16000 >= self._vp_min_register_sec:
+                    spk_id = self.voiceprint.register(samples) or None
+            self._vp_round.append(
+                (spk_id, self.voiceprint.speaker_label(spk_id), text))
             if self._vp_use_cache and spk_id:
                 self._vp_id_cache[tx_spk] = (spk_id, score)
         except Exception as exc:
             logger.warning("[inbound] 说话人识别异常: %s", exc)
 
     def _on_asr_complete(self) -> None:
-        """整段识别完成 → 上行 asr_result（含 voiceprint 说话人标签前缀）。"""
+        """整段识别完成 → 上行 asr_result（含说话人标签与结构化 speakers）。"""
         if self.asr is None:
             return
         text = (self.asr.last_text or "").strip()
@@ -262,18 +269,33 @@ class Inbound:
             logger.info("[inbound] ASR 结果为空，跳过")
             return
         msg = text
+        speakers: list[dict] = []
         if self.voiceprint is not None and self._vp_round:
             # 每句: "[爸爸 (ID: 100)] 打开客厅灯"（多句换行）；格式见 PROTOCOL.md §5
-            msg = "\n".join(f"[{label}] {t}" for label, t in self._vp_round)
+            msg = "\n".join(f"[{label}] {t}" for _, label, t in self._vp_round)
+            speakers = [{"spk_id": spk_id or "",
+                         "name": self.voiceprint.display_name(spk_id),
+                         "label": label, "text": t}
+                        for spk_id, label, t in self._vp_round]
             self._vp_round.clear()
         self._turn_seq += 1
         logger.info("[inbound] 用户说: %s", msg[:60])
         self._fire(P.EVT_ASR_RESULT, {
             "text": msg,
+            "speakers": speakers,
             "wake": self._current_wake,
             "message_id": f"voice-{int(time.time() * 1000)}",
             "turn_seq": self._turn_seq,
         })
+        # 对话历史日志：逐句记录说话人（人工维护身份用）
+        if self.chat_log is not None:
+            if speakers:
+                for spk in speakers:
+                    self.chat_log.user(wake=self._current_wake,
+                                       spk_id=spk["spk_id"],
+                                       name=spk["name"], text=spk["text"])
+            else:
+                self.chat_log.user(wake=self._current_wake, text=text)
         # 开始等待回复：循环等待音 + 超时兜底（→ playback）
         if self.playback is not None:
             self.playback.on_utterance_done()

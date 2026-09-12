@@ -39,6 +39,9 @@ class VoiceServer:
         self._client_id: str = ""
         # outbound：Playback（M3 装配后由 app 注入；None=仅骨架）
         self.playback: Optional[Any] = None
+        # 说话人身份绑定（SpeakerAliases；app 在启用声纹时注入）：
+        # 供 speaker_alias 帧读写 names.json，None=说话人识别未启用
+        self.speaker_admin: Optional[Any] = None
         # 实际助手表（wake_word.assistants，config 唯一源；app 装配时注入）。
         # welcome.my_wakewords 回报给客户端：gateway 依此知道有哪些助手会话。
         self._assistants: list = []
@@ -214,12 +217,51 @@ class VoiceServer:
                 logger.info("[voice_service] 收到 interrupt（无 playback，仅记录）")
             await self.send_frame(P.ack_for(seq, True))
             return
+        if type_ == P.CMD_SPEAKER_ALIAS:
+            # 说话人身份绑定（agent 工具 → 服务端写 names.json 并热更新显示名）。
+            # 成功/失败都带数据（失败时附 previous 等，便于 agent 向用户解释）。
+            result = self._handle_speaker_alias(data)
+            ok = bool(result.pop("ok", False))
+            extra = {"seq": seq, "ok": ok}
+            if ok:
+                extra.update(result)
+            else:
+                extra["error"] = result.pop("error", None) or "speaker_alias 失败"
+                extra.update(result)
+            await self.send_frame(P.make_frame(P.EVT_ACK, extra, seq=seq))
+            return
         if type_ == P.EVT_ACK:
             # 服务端通常不主动向客户端发命令；收到 ack 只记日志（未来 speak_done 也走 S→C）
             logger.debug("[voice_service] 客户端 ack: %s", data)
             return
         logger.warning("[voice_service] 未知帧类型: %s", type_)
         await self.send_frame(P.ack_for(seq, False, f"unknown type: {type_}"))
+
+    def _handle_speaker_alias(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """说话人绑定/解绑（`speaker_alias` 帧）。
+
+        返回给 ack 的 payload（`ok` 由调用方取走）：成功带 `spk_id/name/previous/
+        also_bound` 等；失败只有 `ok=False, error`。绑定写入 names.json 并立即生效
+        （下一句 `asr_result` 的标签就会用新名字），无需重启。
+        """
+        if self.speaker_admin is None:
+            return {"ok": False, "error": "说话人识别未启用（voiceprint 未开启）"}
+        action = str((data or {}).get("action") or "").strip().lower()
+        spk_id = (data or {}).get("spk_id")
+        if action == P.ALIAS_SET:
+            result = self.speaker_admin.set_alias(
+                spk_id, (data or {}).get("name") or "",
+                overwrite=bool((data or {}).get("overwrite")))
+        elif action == P.ALIAS_UNSET:
+            result = self.speaker_admin.unset_alias(spk_id)
+        else:
+            result = {"ok": False, "error": f"未知 action: {action!r}"}
+        if result.get("ok"):
+            logger.info("[voice_service] speaker_alias %s → %s", action, result)
+        else:
+            logger.warning("[voice_service] speaker_alias %s 失败: %s",
+                           action, result.get("error"))
+        return result
 
     # ─── 上行事件（供 inbound 装配后调用）────────────────
 

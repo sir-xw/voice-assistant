@@ -105,6 +105,7 @@ VAD、TTS、播放队列、连续对话窗口全部由服务端负责。
 | `speak` | `{id, wake, kind, segments, turn_seq}` | **唯一播放入口**，见 §6 |
 | `control` | `{action, ...}` | `close_window`：关闭连续对话窗口、回到唤醒词监听（**客户端应把"不朗读"结束标记翻译成这一帧**，例如 `[FINISH]`）；`dismiss_reply` / `reload_kws` 为预留（当前仅记日志）；未知 action 记日志后仍 `ack ok` |
 | `interrupt` | `{}` | 停 TTS、清空播报队列、停等待音（物理打断通常由服务端本地处理，这一帧用于客户端主动打断） |
+| `speaker_alias` | `{action, spk_id, name?, overwrite?}` | 说话人身份绑定（agent 工具链路），见 §4.1 |
 | `ping` | `{}` | 心跳，服务端回 `pong`（同 `seq`） |
 | `bye` | `{reason?}` | 优雅断开：先 `ack`，服务端再以 `1000` 关闭 |
 
@@ -116,6 +117,40 @@ VAD、TTS、播放队列、连续对话窗口全部由服务端负责。
 ```
 
 > 注意：`speak` 因"迟到的旧轮"被丢弃时，`ack` 仍是 `ok:true`（静默丢弃，见 §6）。
+> `speaker_alias` 的 `ack.data` 会带结果字段（`ok/error/spk_id/name/previous/...`），
+> 客户端按 `seq` 关联请求与应答（见 §4.1）。
+
+### 4.1 说话人身份绑定（`speaker_alias`）
+
+用户亲口说出身份后，agent 需要"记住这个声音是谁"。绑定写入
+`models/voiceprint_lib/names.json` 并**立即生效**（下一句 `asr_result` 的标签就用新名字，
+无需重启服务）；优先级高于 config 的 `voiceprint.speaker_names`（人工 seed）。
+
+```json
+{"v":1,"type":"speaker_alias","seq":31,"client_id":"my-agent","ts":0,
+ "data":{"action":"set","spk_id":"101","name":"辰辰","overwrite":false}}
+```
+
+| action | data | 说明 |
+|---|---|---|
+| `set` | `{spk_id, name, overwrite?}` | 绑定姓名；`spk_id` 接受 `101` 或 `spk_101`（自动补前缀）。该编号已绑定**别的**名字且 `overwrite` 非真时**不写**，ack 返回 `ok:false` + 现有名字（`previous`），客户端应确认后带 `overwrite:true` 重试。同一名字**允许绑定多个编号**（声纹偏严，同一个人可能被注册成新编号） |
+| `unset` | `{spk_id}` | 解除绑定（只删运行时绑定；来自 config `speaker_names` 的绑定需改配置） |
+
+`ack` 示例：
+
+```json
+{"v":1,"type":"ack","seq":31,"client_id":"","ts":0,
+ "data":{"seq":31,"ok":true,"spk_id":"spk_101","name":"辰辰",
+         "previous":null,"unchanged":false,"also_bound":[]}}
+{"v":1,"type":"ack","seq":32,"client_id":"","ts":0,
+ "data":{"seq":32,"ok":false,"spk_id":"spk_101","previous":"辰辰",
+         "error":"spk_101 当前绑定为「辰辰」；如已向用户确认要更正，请带 overwrite=true 重试"}}
+```
+
+`ok:false` 的常见原因：编号格式非法、编号不在声纹库（未注册）、名字为空/超过 16 字/含换行
+或方括号/为「未知」、需要 `overwrite`、未知 `action`、说话人识别未启用
+（`voiceprint.enabled: false` 或服务未以 `--audio` 启动）。客户端把 `error` 原样转述给
+agent 即可（它已经写成给模型看的中文）。
 
 ---
 
@@ -124,9 +159,9 @@ VAD、TTS、播放队列、连续对话窗口全部由服务端负责。
 | type | data | 触发时机 |
 |---|---|---|
 | `welcome` | `{ok, my_wakewords, version}` | `hello` 应答（§3） |
-| `ack` | `{seq, ok, error?}` | 每条命令的应答 |
+| `ack` | `{seq, ok, error?, ...}` | 每条命令的应答；`speaker_alias` 的 ack 另带结果字段 |
 | `wake_word` | `{keyword, wake}` | 唤醒词命中（服务端已本地播提示音/打断）。两者均为**助手名**（服务端 KWS 词表的 `@` 后缀） |
-| `asr_result` | `{text, wake, message_id, turn_seq}` | 用户一段话识别完成（**主事件**）；`text` 见下方说明（声纹启用时含说话人前缀） |
+| `asr_result` | `{text, speakers, wake, message_id, turn_seq}` | 用户一段话识别完成（**主事件**）；`text`/`speakers` 见下方说明 |
 | `speak_done` | `{id, kind, ok}` | 一段 `speak` 播报完成（`ok=false` 表示 TTS/播放失败） |
 | `pong` | `{}` | `ping` 应答（同 `seq`） |
 | `asr_interim` | `{text, wake}` | **预留，当前不发送**（需 `caps.interim`） |
@@ -137,8 +172,10 @@ VAD、TTS、播放队列、连续对话窗口全部由服务端负责。
 
 ```json
 {"v":1,"type":"asr_result","seq":null,"client_id":"","ts":0,
- "data":{"text":"[爸爸 (ID: 100)] 今天天气怎么样？","wake":"小布",
-         "message_id":"voice-1710000000123","turn_seq":12}}
+ "data":{"text":"[爸爸 (ID: 100)] 今天天气怎么样？",
+         "speakers":[{"spk_id":"spk_100","name":"爸爸",
+                      "label":"爸爸 (ID: 100)","text":"今天天气怎么样？"}],
+         "wake":"小布","message_id":"voice-1710000000123","turn_seq":12}}
 ```
 
 - `wake`：本轮属于哪个助手（你用它做会话路由，例如 `chat_id = "wake:" + wake`）；
@@ -146,10 +183,15 @@ VAD、TTS、播放队列、连续对话窗口全部由服务端负责。
 - `text`：识别文本；服务端启用声纹（`voiceprint.enabled`）时**按句换行**，每句带
   `[说话人名字 (ID: 编号)]` 前缀，例如：
   `"[爸爸 (ID: 100)] 打开客厅灯\n[未知 (ID: 101)] 你好"`。
-  名字取 `voiceprint.speaker_names`（`spk_100` → 真实姓名）映射，未映射时显示「未知」；
+  名字取身份绑定映射（`names.json` > config `speaker_names`），未绑定时显示「未知」；
   编号是声纹库 id 的数字部分（`spk_100` → `100`），同一说话人跨轮次稳定，可用于区分不同人。
   名字与编号始终成对出现；识别不出且未注册时只有「未知」（无编号）。
   **客户端把 `text` 原样作为用户消息交给 agent 即可，无需再解析或重排**；
+- `speakers`：同一轮的结构化说话人（一句一条，与 `text` 的行一一对应），供客户端做身份
+  绑定等结构化处理，**不要用正则去解析 `text`**：
+  - `spk_id`：声纹库内部 id（`spk_101`），未识别到编号时为空串；
+  - `name`：显示名（未绑定为「未知」）；`label`：与 `text` 前缀里完全一致；
+  - `text`：该句原文。语音未启用声纹时为 `[]`；
 - `message_id`：`voice-<epoch_ms>`，仅用于日志串联。
 
 ---
@@ -252,7 +294,9 @@ asyncio.run(main())
 | `service.wait_reply_timeout_sec` | `asr_result` 后等待 `speak` 的超时，超时播告别语（默认 45s） |
 | `conversation_window.timeout_sec` | `final` 播完后的连续对话窗口时长 |
 | `wake_word.assistants` | 助手表（`name` = 上行事件里的 `wake`）；服务端据此生成 KWS 词表 |
-| `voiceprint.enabled` | 是否在 `asr_result.text` 中按句加 `[名字 (ID: 编号)]` 前缀 |
+| `voiceprint.enabled` | 是否在 `asr_result.text` 中按句加 `[名字 (ID: 编号)]` 前缀、是否填充 `speakers`。启用即**始终自动注册**未知说话人（编号是身份绑定的锚点，无 `auto_register` 开关） |
+| `voiceprint.speaker_names` | 人工维护的编号 → 名字 seed；agent 通过 `speaker_alias` 写的 `models/voiceprint_lib/names.json` 优先级更高 |
+| `chat_log.enabled` / `dir` / `retention_days` | 对话历史日志（`chat-YYYY-MM-DD.log`，JSONL：时间/角色/助手名/说话人/完整内容），供人工核对并维护说话人身份；默认开启、30 天 |
 
 ---
 
@@ -260,5 +304,8 @@ asyncio.run(main())
 
 - `v=1` 内**只做加法**：新增帧类型/`data` 字段不影响既有客户端；客户端应忽略未知 `type` 与未知字段；
 - `asr_interim` / `asr_sentence` / `error` 与 `control{dismiss_reply|reload_kws}` 已占位（见 `protocol.py` 常量），实现后无需变更协议版本；
-- 常量与工具函数（`make_frame` / `dumps` / `loads` / `ack_for` / `parse_emotion_segments`）都在
+- `asr_result.data.speakers`（结构化说话人）与 C→S `speaker_alias`（身份绑定）都是 v1
+  内新增：旧客户端忽略 `speakers` 即可，`speaker_alias` 只在客户端主动发时才用到；
+- 常量与工具函数（`make_frame` / `dumps` / `loads` / `ack_for` / `normalize_spk_id` /
+  `speaker_number` / `parse_emotion_segments`）都在
   [`voice_service/protocol.py`](voice_service/protocol.py)，可直接复制（本文件与代码同源）。

@@ -12,9 +12,13 @@ Voice Service ↔ hermes voice gateway（hermes_gateway_plugin）之间的 WebSo
 
 帧类型：
 - C→S（命令，hermes voice gateway → Voice Service）：hello / speak / control /
-  interrupt / ping / bye
+  interrupt / speaker_alias / ping / bye
 - S→C（事件/应答，Voice Service → hermes voice gateway）：welcome / ack /
   wake_word / asr_interim / asr_sentence / asr_result / speak_done / error / pong
+
+说话人身份：`asr_result.data.speakers` 给出结构化说话人（`{spk_id, name, label, text}`），
+`asr_result.data.text` 是给 agent 看的 `[名字 (ID: 编号)] 内容` 文本；agent 侧要绑定身份时
+发 `speaker_alias`，服务端写 names.json 并热更新显示名（详见 PROTOCOL.md §5/§6）。
 
 唤醒词 → 助手映射由 **Voice Service** 维护（config ``wake_word.assistants``，
 KWS 命中返回 ``@助手名``）。hello 不再携带期望词表，客户端只用上行事件里
@@ -39,8 +43,13 @@ CMD_HELLO = "hello"              # 连接建立后首帧：认证 + 上报能力
 CMD_SPEAK = "speak"              # 有文本要朗读（唯一播放入口）
 CMD_CONTROL = "control"          # 流程控制（close_window 等）
 CMD_INTERRUPT = "interrupt"      # gateway 主动取消播放（罕见）
+CMD_SPEAKER_ALIAS = "speaker_alias"  # 说话人身份绑定（agent 工具写入，ack 回结果）
 CMD_PING = "ping"
 CMD_BYE = "bye"
+
+# speaker_alias.action
+ALIAS_SET = "set"                # 绑定/覆盖：{spk_id, name}
+ALIAS_UNSET = "unset"            # 解除绑定：{spk_id}
 
 # 事件/应答：S→C
 EVT_WELCOME = "welcome"          # hello 应答：回报服务端实际助手表（my_wakewords）
@@ -113,8 +122,38 @@ def loads(line: str) -> Dict[str, Any]:
 
 
 def ack_for(seq: int, ok: bool, error: Optional[str] = None) -> Dict[str, Any]:
-    """构造一条 ack 应答帧。"""
+    """构造一条 ack 应答帧（纯 ok/error；带数据的 ack 由调用方自行 make_frame）。"""
     return make_frame(EVT_ACK, {"seq": seq, "ok": ok, "error": error}, seq=seq)
+
+
+# 声纹库内部 id 形如 ``spk_<N>``（自动注册从 spk_100 起）
+_SPK_ID_PATTERN = re.compile(r"spk_(\d+)\Z")
+
+
+def normalize_spk_id(value: Any) -> str:
+    """把 agent/工具给的说话人编号归一成声纹库内部 id。
+
+    接受 ``"101"``（消息前缀里显示的编号）/ ``"spk_101"``（库内 id）/ 整数 101；
+    其它形式返回 ``""``（调用方按非法参数处理）。
+    """
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, int):
+        return f"spk_{value}" if value >= 0 else ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return f"spk_{text}"
+    if _SPK_ID_PATTERN.fullmatch(text):
+        return text
+    return ""
+
+
+def speaker_number(spk_id: str) -> str:
+    """内部 id（``spk_101``）→ 展示用编号（``101``）；非 spk_<N> 形式原样返回。"""
+    m = _SPK_ID_PATTERN.fullmatch(str(spk_id or ""))
+    return m.group(1) if m else str(spk_id or "")
 
 
 # ─── (情绪)文字 分段解析 ──────────────────────────────────
@@ -204,6 +243,27 @@ def _selftest() -> None:
         raise AssertionError("版本缺失应报错")
     except ValueError:
         pass
+
+    # 9) 说话人编号归一
+    assert normalize_spk_id("101") == "spk_101"
+    assert normalize_spk_id(" 101 ") == "spk_101"
+    assert normalize_spk_id("spk_101") == "spk_101"
+    assert normalize_spk_id(101) == "spk_101"
+    assert normalize_spk_id("") == ""
+    assert normalize_spk_id(None) == ""
+    assert normalize_spk_id(True) == ""
+    assert normalize_spk_id("爸爸") == ""
+    assert normalize_spk_id("spk_x") == ""
+    assert speaker_number("spk_101") == "101"
+    assert speaker_number("爸爸") == "爸爸"
+
+    # 10) 说话人绑定帧 + 带数据的 ack
+    frame = make_frame(CMD_SPEAKER_ALIAS, {
+        "action": ALIAS_SET, "spk_id": "spk_101", "name": "辰辰"}, seq=31)
+    assert loads(dumps(frame))["data"]["action"] == ALIAS_SET
+    ack = make_frame(EVT_ACK, {"seq": 31, "ok": True,
+                               "spk_id": "spk_101", "name": "辰辰"}, seq=31)
+    assert loads(dumps(ack))["data"]["name"] == "辰辰"
     print("[voice_service.protocol] 自检通过 ✅")
 
 

@@ -25,6 +25,21 @@ python -m voice_service --config config.yaml
 `hermes_gateway_plugin` 即复用同一模块）。详细架构设计见
 `docs/voice-service-websocket-architecture.md`。
 
+## 说话人身份与对话历史
+
+- **说话人识别**：`voiceprint` 启用后每句话都标注说话人，上行格式为
+  `[名字 (ID: 编号)] 内容`（另有结构化 `asr_result.data.speakers`，见 `PROTOCOL.md` §5）。
+  未知说话人**始终自动注册**新编号（`spk_100` 起；旧的 `auto_register` 开关已取消 ——
+  没有编号就无法关联身份）。
+- **身份绑定**：编号 → 名字的映射有两层，后者优先：
+  `config.yaml` 的 `voiceprint.speaker_names`（人工 seed）与
+  `models/voiceprint_lib/names.json`（agent 通过 `speaker_alias` 帧写入，见 `PROTOCOL.md` §4.1）。
+  两者都是纯文本，人工可直接编辑；改完重启服务生效（agent 绑定则即时生效）。
+- **对话历史**：`chat_log` 段（默认开启）把每轮会话写成 `logs/chat-YYYY-MM-DD.log`
+  （JSONL：`ts` / `role` / `wake` / `speaker` / `kind` / `text`，完整不截断），
+  便于回看"哪个编号说了什么"再修正身份映射；超过 `retention_days` 自动清理。
+  该文件含家庭对话原文，已在 `.gitignore` 中排除。
+
 ## 调试工具（`tests/` 与 `tools/`）
 
 均为手工脚本，在 `voice_service/` 目录下运行（`voice_service` 已 editable 安装）：
@@ -38,6 +53,12 @@ python -m voice_service --config config.yaml
   （空库首次运行自动注册新说话人，`--reuse` 复用特征库）
 - **云端 ASR**：`tests/test_tencent_asr.py --help`（读 `.env` 凭据 + `config.yaml` 默认值；
   `--sine 3` 可无麦克风验证）
+- **说话人身份 / 对话历史 / WS 联调**（都不需要麦克风与声纹模型）：
+  `tests/test_speaker_alias.py`（绑定/冲突/覆盖/一人多编号/持久化/入库校验）、
+  `tests/test_chat_log.py`（JSONL 字段、按天滚动、保留期清理）、
+  `tests/test_inbound_speakers.py`（`asr_result` 的 `text`/`speakers` 契约与逐句日志）、
+  `tests/test_ws_speaker_alias.py`（起真实 WS 服务端 + 客户端，验证 `speaker_alias`
+  请求/应答、并发不串号、绑定落盘）
 - **模型下载**：`python -u tools/download_models.py [--check|--force]`
   （按 `config.yaml` 的 `kws.model_name` / `models.*` 下载到 `models/`）
 - **提示音生成**：`python -u tools/tts_gen.py --text "你好" --output prompt.wav`

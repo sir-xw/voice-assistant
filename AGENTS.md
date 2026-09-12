@@ -55,6 +55,10 @@
 - hermes 侧只配连接参数：`~/.hermes/config.yaml` 的 `platforms.voice.extra.service`
   （`url`/`token`）。**不再配置 wakewords**；如需按助手覆盖 prompt/model，用 hermes 原生
   `channel_overrides`（键 `wake:<助手名>`）。
+- hermes 的 `platform_toolsets.voice` 是**显式白名单**：插件提供的 `voice_speaker` 工具集
+  必须列在里面（已配置），否则 `voice_speaker_bind` 不会进入 agent 的工具表。
+- `voice_service/config.yaml` 的 `chat_log`（`enabled`/`dir`/`retention_days`）控制对话历史
+  日志；`voiceprint` 段无 `auto_register`（已取消）。
 - 音乐 MCP：`~/.hermes/config.yaml` 的 `mcp_servers.music`（`url: http://127.0.0.1:8766/mcp`）。
 - gitignore 覆盖 `*.log`/`*.wav`/`.env`/`models/`/`__pycache__`/`.venvs/` 等；包内提示音
   `voice_service/voice_service/assets/*.wav` 需入库（已有豁免规则）。
@@ -84,14 +88,27 @@
 - `post_api_request` 是 hermes **全局 observer 钩子**，必须按 `platform == "voice"` 过滤来源
   （已实现，勿移除），否则 CLI 等会话的回复也会被朗读。
 
-## 语音输入契约（说话人前缀）
+## 语音输入契约（说话人前缀与身份绑定）
 
 - voiceprint 启用时，**Voice Service** 在 `asr_result.text` 里按句拼好
   `[说话人名字 (ID: 编号)] 内容`（多句换行），例如 `[爸爸 (ID: 100)] 打开客厅灯`、
-  `[未知 (ID: 101)] 你好`；是否加前缀与 `voiceprint.enabled` 绑定，格式与规则见
-  `voice_service/PROTOCOL.md` §5。
-- 名字取 `voiceprint.speaker_names`（`spk_100` → 真实姓名），未映射/未识别显示「未知」；
-  编号为声纹库 id 的数字部分（`spk_100` → `100`），同一人跨轮次稳定 —— agent 据此区分说话人。
+  `[未知 (ID: 101)] 你好`；同时给结构化 `asr_result.data.speakers`
+  （`{spk_id, name, label, text}`，与文本行一一对应）——插件用它做身份绑定，
+  **不得正则解析 `text`**。格式与规则见 `voice_service/PROTOCOL.md` §5。
+- 名字取身份绑定映射（`models/voiceprint_lib/names.json`（agent 写，优先）→
+  `config.yaml` 的 `voiceprint.speaker_names`（人工 seed）），未绑定/未识别显示「未知」；
+  编号为声纹库 id 的数字部分（`spk_100` → `100`），同一人跨轮次稳定。
+- **始终自动注册**未知说话人（`spk_100` 起）：编号是身份绑定的锚点，`auto_register`
+  开关已取消（配置里残留该键只打 warning）。启用声纹 = 识别 + 自动注册 + 可绑定。
+- **身份绑定工具** `voice_speaker_bind`（工具集 `voice_speaker`，hermes 侧需在
+  `platform_toolsets.voice` 列出该工具集）：用户亲口说明身份后，插件按
+  `session_id → wake → 最近一轮说话人` 取编号，发 WS `speaker_alias` 帧，服务端校验
+  （编号必须在声纹库、名字 ≤16 字且非「未知」）后写 names.json 并**即时生效**。
+  已绑异名时需 `overwrite=true`（提示词要求先向用户确认，认错人场景直接覆盖）；
+  同一名字允许多个编号。该工具只对语音会话生效（非语音会话直接拒绝）。
+- **对话历史**：`chat_log`（默认开启）在 `voice_service/logs/chat-YYYY-MM-DD.log`
+  记 JSONL（时间/角色/助手名/说话人/完整内容），供人工核对身份；含家庭对话原文，
+  必须保持 gitignore（`voice_service/logs/`）。
 - 拼接只在服务端（`voiceprint.speaker_label` + `inbound.py`）完成；gateway 插件与 agent
   侧**原样透传、不解析不重排**。改动格式需同步插件 `platform_hint` 与 `PROTOCOL.md`。
 
@@ -108,6 +125,12 @@
   `test_voiceprint_live.py`（说话人/声纹；`tests/4spk.wav` 用于对比模型分离效果）
 - 语音工具（`voice_service/tools/`）：`download_models.py`（按配置下载模型到 `models/`）、
   `tts_gen.py`（腾讯云 TTS 生成提示音资产）
+- 说话人身份 / 对话历史 / WS 联调（**不需要麦克风、声纹模型、凭据**）：
+  `voice_service/tests/test_speaker_alias.py`（绑定语义与持久化）、
+  `test_chat_log.py`（对话日志字段与清理）、
+  `test_inbound_speakers.py`（`asr_result` 的 `text`/`speakers` 契约与逐句日志）、
+  `test_ws_speaker_alias.py`（起真实 WS 服务端+客户端跑 `speaker_alias`）；
+  `hermes_gateway_plugin/tests/test_speaker_bind.py`（`voice_speaker_bind` 工具分支）
 - 握手/联调：临时起 `voice_service`（覆盖端口、不带 `--audio`）用 WS 客户端验证
   `hello/welcome`、`speak/ack`；参考 `voice_service/PROTOCOL.md` 的最小示例
 

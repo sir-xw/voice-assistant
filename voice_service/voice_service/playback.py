@@ -39,11 +39,12 @@ _PCM_BYTES_PER_SEC = 16000 * 2
 class Playback:
     def __init__(self, cfg: VoiceServiceConfig, server,
                  frontend_provider: Callable[[], Optional[Any]],
-                 *, silent: bool = False):
+                 *, silent: bool = False, chat_log=None):
         self.cfg = cfg
         self.server = server
         self.get_frontend = frontend_provider
         self.silent = silent
+        self.chat_log = chat_log     # ChatLog | None（对话历史，人工维护身份用）
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._queue: Optional[asyncio.Queue] = None
@@ -364,6 +365,10 @@ class Playback:
             if keep_waiting:
                 await self._start_wait_tone()
             return
+
+        # 对话历史日志：记录实际播出的完整文本（含被打断回复的「我是X，」前缀）
+        if self.chat_log is not None:
+            self.chat_log.assistant(wake=wake, kind=kind, text="\n".join(texts))
 
         if not is_final:
             # 中间轮播完：仍在等最终回复 → 恢复等待音 + 回复超时兜底

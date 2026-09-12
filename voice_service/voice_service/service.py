@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+from .chat_log import ChatLog
 from .inbound import Inbound, DEFAULT_KWS_MODEL_NAME
 from .playback import Playback
 from .server import VoiceServer
@@ -31,6 +32,7 @@ class VoiceServiceApp:
         self.server = VoiceServer(cfg.service)
         self.inbound: Optional[Inbound] = None
         self.playback: Optional[Playback] = None
+        self.chat_log: Optional[ChatLog] = None
         self._assistants: List[dict] = []   # wake_word.assistants（start 时装配）
 
     @property
@@ -64,12 +66,18 @@ class VoiceServiceApp:
 
         await self.server.start()
 
+        # 对话历史日志（人工维护说话人身份用；config chat_log 段控制）
+        self.chat_log = ChatLog.from_config(
+            self.cfg.raw.get("chat_log"),
+            Path(__file__).resolve().parent.parent)
+        self.chat_log.ensure_ready()
+
         # outbound：播报队列（frontend 提供者 = inbound 创建的 frontend）
         def get_frontend():
             return self.inbound.frontend if self.inbound is not None else None
 
         self.playback = Playback(self.cfg, self.server, get_frontend,
-                                 silent=not audio_out)
+                                 silent=not audio_out, chat_log=self.chat_log)
         self.server.playback = self.playback
         try:
             await self.playback.start()
@@ -79,9 +87,13 @@ class VoiceServiceApp:
             self.server.playback = None
 
         if audio:
-            self.inbound = Inbound(self.cfg, self.server, playback=self.playback)
+            self.inbound = Inbound(self.cfg, self.server, playback=self.playback,
+                                   chat_log=self.chat_log)
             try:
                 self.inbound.enable()
+                # 声纹启用时把身份绑定存储交给 server（speaker_alias 帧读写）
+                if self.inbound.voiceprint is not None:
+                    self.server.speaker_admin = self.inbound.voiceprint.aliases
                 self.inbound.start()
                 logger.info("[app] 语音输入已启动（唤醒词监听中）")
             except Exception as exc:
@@ -103,4 +115,7 @@ class VoiceServiceApp:
                 await self.playback.stop()
             except Exception as exc:
                 logger.warning("[app] playback stop: %s", exc)
+        if self.chat_log is not None:
+            self.chat_log.close()
+            self.chat_log = None
         await self.server.stop()

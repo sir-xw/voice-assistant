@@ -74,7 +74,7 @@ def main():
         threshold=0.6,
         speaker_names={"spk_100": "爸爸"},  # 模拟管理员已把 spk_100 映射为"爸爸"
     )
-    auto_register = True
+    auto_register = True     # 服务端始终自动注册（auto_register 开关已取消）
     min_register_sec = 1.5
     use_cache = True
     vp_round: list[tuple[str, str]] = []

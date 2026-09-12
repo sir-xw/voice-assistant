@@ -64,12 +64,20 @@ voice_service:
     enabled: true
     threshold: 0.6
     lib_dir: "models/voiceprint_lib"
-    auto_register: true
-    min_register_sec: 1.5
+    min_register_sec: 1.5          # 短于此时长的音频不自动注册（防噪声）
     speaker_id_cache: true
-    speaker_names:                # 声纹库 id → 显示名（按实际部署填写）
+    speaker_names:                # 声纹库 id → 显示名（人工 seed，按实际部署填写）
       spk_100: "用户一"           # agent 收到的前缀: [用户一 (ID: 100)]
       spk_101: "用户二"
+    # 说明：启用说话人识别即**始终自动注册**未知说话人（spk_100 起）——
+    # 身份绑定以编号为锚点，不再提供 auto_register 开关。
+    # agent 通过 voice_speaker_bind 工具写入的绑定存到
+    # models/voiceprint_lib/names.json，优先级高于上面的 speaker_names。
+
+  chat_log:                       # 对话历史（人工核对/维护说话人身份用）
+    enabled: true
+    dir: "logs"                   # 相对 voice_service/；每天一个 chat-YYYY-MM-DD.log（JSONL）
+    retention_days: 30            # 过期文件自动删除；0 = 永久保留
 
   music_coordinator:
     enabled: true

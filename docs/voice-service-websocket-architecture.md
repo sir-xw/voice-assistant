@@ -137,6 +137,7 @@ hermes gateway 进程 ─────────────► gateway 会话�
 | `speak` | hook/send 有文本要朗读 | `{id, wake, kind:"interim"\|"final"\|"raw", segments:[{emotion, text}], turn_seq}` | 唯一播放入口；进入串行播报队列 |
 | `control` | 流程控制 | `{action:"close_window"\|"dismiss_reply"\|"reload_kws", ...}` | 关对话窗口（`[FINISH]`）；`dismiss_reply`/`reload_kws` 为 M4 后可选增强（§9 裁决 A / §6.4） |
 | `interrupt` | gateway 主动取消播放（罕见；本地打断通常不需要） | `{all:true, up_to_id?}` | 打断 TTS + 清播放队列 |
+| `speaker_alias` | agent 工具（`voice_speaker_bind`）绑定说话人身份 | `{action:"set"\|"unset", spk_id, name?, overwrite?}` | 写 `models/voiceprint_lib/names.json` 并即时生效；已绑异名需 `overwrite`（协议细节见 `PROTOCOL.md` §4.1） |
 | `ping` / `bye` | 心跳 / 优雅断开 | `{}` / `{reason}` | — |
 
 **S→C（Voice Service → hermes voice gateway，事件/应答）**
@@ -144,11 +145,11 @@ hermes gateway 进程 ─────────────► gateway 会话�
 | type | 时机 | data 字段 | 说明 |
 |---|---|---|---|
 | `welcome` | hello 应答 | `{ok, my_wakewords:[{name, keywords:[]}, ...], version}` | 服务端回报实际助手表（config `wake_word.assistants`），供客户端知情/人工对照 |
-| `ack` | 命令应答 | `{seq, ok, error?}` | 每命令一 ack；`speak` 之外的基础可靠性 |
+| `ack` | 命令应答 | `{seq, ok, error?, ...}` | 每命令一 ack；`speaker_alias` 的 ack 另带 `spk_id/name/previous/also_bound` 等结果 |
 | `wake_word` | KWS 命中（本地已播提示音/打断） | `{keyword, wake, ts}` | 客户端记录「当前活跃助手名」（wake=KWS `@助手名`） |
 | `asr_interim` | ASR 中间结果（需 hello 声明 caps.interim） | `{text, wake}` | 可选，v1 默认关闭 |
 | `asr_sentence` | 每个完成句（voiceprint 开时附带说话人） | `{text, speaker_id?, speaker_label?, start_ms?, end_ms?}` | 供客户端观察/日志 |
-| `asr_result` | VAD 判定整段结束、ASR final（**inbound 主事件**） | `{text, wake, message_id, turn_seq}` | 客户端据此构造 `MessageEvent`；声纹启用时 `text` 已按句带 `[名字 (ID: 编号)]` 前缀 |
+| `asr_result` | VAD 判定整段结束、ASR final（**inbound 主事件**） | `{text, speakers:[{spk_id, name, label, text}], wake, message_id, turn_seq}` | 客户端据此构造 `MessageEvent`；声纹启用时 `text` 已按句带 `[名字 (ID: 编号)]` 前缀，`speakers` 供结构化处理（身份绑定） |
 | `speak_done` | 一段/一 final 播报完成 | `{id, kind, ok, error?}` | 供客户端记录「播完」与告警 |
 | `error` | 服务端异常 | `{code, message}` | — |
 | `pong` | ping 应答 | `{}` | — |
@@ -351,7 +352,8 @@ voice_service:
   vad:         # ...
   asr:         # ...（腾讯云引擎配置；凭据走项目 .env 的 VOICE_SecretId/Key/AppId）
   tts:         # ...
-  voiceprint:  # ...（特征库路径 models/voiceprint_lib、speaker_names —— 声纹只在服务侧出现）
+  voiceprint:  # ...（特征库路径 models/voiceprint_lib、speaker_names seed、min_register_sec；始终自动注册，声纹只在服务侧出现）
+  chat_log:    # 对话历史 JSONL（enabled/dir/retention_days），供人工维护说话人身份
   assets:      # prompt/notification/farewell/wait_cue 路径
   music_coordinator:  # 播报避让：每段 TTS 前/后调协调器 hold/release（Unix socket），不直连 MPD（见 §10）
     socket: "/run/user/0/music-coordinator.sock"
@@ -359,7 +361,7 @@ voice_service:
   mic:         # 设备选择/采集失效检测参数（no_data_timeout_sec、fail_cooldown_sec）
 ```
 
-> 与 hermes 侧配置的边界：hermes 自己的接入参数（WS `url`/`token`、`channel_overrides` 按 chat_id=`wake:<助手名>` 覆盖 prompt/model）仍写在 hermes 的配置文件里（`~/.hermes/config.yaml`），那是 **hermes 平台插件的标准配置位**（类比飞书插件的 bot token 也在 hermes 配置里）——「不放 hermes profile」指的是 Voice Service **自身**的语音/凭据/模型/词表配置，两者不冲突。唤醒词↔助手映射只此一份（Voice Service `wake_word.assistants`），hermes 侧不再配置 `platforms.voice.extra.wakewords`。
+> 与 hermes 侧配置的边界：hermes 自己的接入参数（WS `url`/`token`、`channel_overrides` 按 chat_id=`wake:<助手名>` 覆盖 prompt/model、`platform_toolsets.voice` 需含插件工具集 `voice_speaker`）仍写在 hermes 的配置文件里（`~/.hermes/config.yaml`），那是 **hermes 平台插件的标准配置位**（类比飞书插件的 bot token 也在 hermes 配置里）——「不放 hermes profile」指的是 Voice Service **自身**的语音/凭据/模型/词表配置，两者不冲突。唤醒词↔助手映射只此一份（Voice Service `wake_word.assistants`），hermes 侧不再配置 `platforms.voice.extra.wakewords`。
 
 ### 4.5 组件装配（对照现状 `adapter._init_*`；右列模块均位于 `voice_service/` 包内）
 
