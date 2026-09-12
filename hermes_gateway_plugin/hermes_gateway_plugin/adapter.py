@@ -318,13 +318,19 @@ def _get_active() -> Optional[VoiceAdapter]:
 
 
 def on_post_api_request(**kwargs):
-    """post_api_request 钩子（观察期）：先记录参数摘要，再按现有语义播报。
+    """post_api_request 钩子（观察期 + 来源过滤）：只处理 voice 平台的回复。
 
-    播报语义保持现役一致（finish_reason=stop → final，tool_calls 带文字 →
-    interim，[FINISH] → 关窗），使对照测试体验不变化；待对比"正常问答轮"
-    与"memory 审查轮"的字段差异后，再据此过滤 system 型消息（记忆更新/
-    自我改进），让语音只朗读用户问题的直接回复。
+    post_api_request 是 hermes 的全局 observer 钩子（每个会话的每次 LLM API
+    请求都会触发），必须按 platform 过滤：非 voice 会话（cli/其它平台）直接
+    return，避免 CLI 等会话的回复被语音朗读。
+
+    播报语义：finish_reason=stop → final，tool_calls 带文字 → interim，
+    [FINISH] → 关窗。待对比"正常问答轮"与"memory 审查轮"的字段差异后，
+    再据此过滤 system 型消息（记忆更新/自我改进），让语音只朗读用户问题的
+    直接回复。
     """
+    if (kwargs.get("platform") or "") != "voice":
+        return  # 非 voice 平台的 API 请求不播报
     logger.info("[voice] post_api_request 参数: %s", _summarize_kwargs(kwargs))
     adapter = _get_active()
     if adapter is None or adapter._client is None:
