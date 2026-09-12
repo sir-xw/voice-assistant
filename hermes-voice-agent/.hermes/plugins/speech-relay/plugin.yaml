@@ -1,4 +1,0 @@
-# .hermes/plugins/speech-relay/plugin.yaml
-name: speech-relay
-version: "1.0"
-description: "把 LLM 回复（post_api_request 钩子）转发给 voice_agent 播放队列"

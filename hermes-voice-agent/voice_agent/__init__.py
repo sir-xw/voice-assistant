@@ -1,1 +1,0 @@
-# Hermes Agent Voice Frontend

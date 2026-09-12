@@ -2,7 +2,7 @@
 
 > 状态：**设计稿 v5（开发中）**
 > v2 变更：进程概念由 Audio Service 统一更名 **Voice Service**；§10 音乐状态协作已定稿。
-> v3 变更：新架构代码收敛为仓库根三个**平级、自包含**的子项目 —— `voice_service`、`hermes_gateway_plugin`、`music_coordinator`（只有 hermes gateway 客户端与 hermes 绑定）；**不再 `from voice_agent.xxx` 复用旧组件库**，可复用代码复制进 `voice_service`；`hermes-voice-agent/` 只作历史/素材源。
+> v3 变更：新架构代码收敛为仓库根三个**平级、自包含**的子项目 —— `voice_service`、`hermes_gateway_plugin`、`music_coordinator`（只有 hermes gateway 客户端与 hermes 绑定）；**不再 `from voice_agent.xxx` 复用旧组件库**，可复用代码复制进 `voice_service`；旧单体实现 `hermes-voice-agent/` 已于 2026-09 删除（历史见 git）。
 > v4 变更：去掉仓库根 `src/` 包裹层（每个子项目自带 pyproject，可装不同 venv）；配置/凭据/模型归属 `voice_service/` 子项目目录；代码骨架已启动。
 > v5 变更（最新）：MCP 接入形态定为 **web（streamable HTTP）端口**（music_coordinator `--enable-mcp`，10 个 mpd_* 工具已可调）；M2 inbound 与 **M3 outbound**（playback 播报队列/等待音/连续对话窗口/turn 兜底/Music Coordinator 音乐避让）代码落地并通过 silent 冒烟；`voice_service` 启动参数 `--audio`（输入）/`--out`（输出），默认不占设备。
 > 术语对照：
@@ -12,7 +12,7 @@
 | Voice Service（语音服务，WS 服务端） | `voice_service/`（子项目） | 独立（零 hermes 依赖） |
 | hermes voice gateway 客户端（`voice-platform` 插件） | `hermes_gateway_plugin/`（子项目） | **唯一依赖 hermes 的部分** |
 | Music Coordinator（音乐状态协调器） | `music_coordinator/`（子项目） | 独立（零 hermes 依赖） |
-| 旧语音前端项目 | `hermes-voice-agent/`（`voice_agent` 包） | 历史/素材源，随迁移逐步冻结 |
+| 旧语音前端项目 | `hermes-voice-agent/`（`voice_agent` 包） | **已删除**（可复用组件/工具迁入 voice_service；历史见 git） |
 
 > 目标：把语音链路里与「音频硬件 / 信号处理 / 语音云 SDK」耦合的部分从 hermes gateway 进程剥离，成为独立的 **Voice Service**（WS 服务端）；hermes 侧的 voice gateway（`voice-platform` 插件）改造为 **WS 客户端**，接收语音识别结果、下发待朗读文本。
 > 已确认的决策前提：
@@ -232,7 +232,6 @@ Voice Service                                   Voice Gateway (hermes)
 
 ```
 voice-assistant/（仓库根）
-├── hermes-voice-agent/              # 旧项目（voice_agent 包）：历史/素材源，逐步冻结
 ├── voice_service/                   # ★ 子项目：语音服务 = WS 服务端（零 hermes 依赖，独立 pyproject）
 │   ├── pyproject.toml / README.md
 │   ├── config.yaml                  #   本服务配置（voice_service: 段；或独立 voice_service.yaml）
@@ -274,7 +273,7 @@ voice-assistant/（仓库根）
 - **`voice_service` 自包含**：可复用组件（`vad`/`voice_frontend`/`asr_engine`/`tts_engine`/
   `audio_player`/`voiceprint`、vendored `tencentcloud_speech/`、`assets/` 提示音）已**复制**
   进 `voice_service/voice_service/`（包根平铺），组件内 `voice_agent.*` import 已改写为
-  `voice_service.*`，运行时不 import 旧包；旧 `hermes-voice-agent/` 冻结为素材源；
+  `voice_service.*`，运行时不 import 旧包；旧实现目录已删除；
 - **`hermes_gateway_plugin` 唯一依赖 hermes**：作为 hermes 插件随 gateway 加载；它
   import `voice_service.protocol` **仅取帧契约**（voice_service 无 hermes 依赖，此方向依赖
   安全）——因此部署到 gateway 的 venv 时需先安装 `voice_service`；
@@ -425,7 +424,7 @@ WS 下行          → speak{kind,segments}：来源
 | sherpa 模型 / voiceprint_lib | ✅（profile `~/.hermes/models/`） | **单一副本归 Voice Service（voice_service 目录 `models/`）**；gateway 客户端不碰模型 |
 | `~/.hermes/voice-agent.yaml`（旧 voice-platform 读的 profile 语音配置） | ✅ | **退役**：服务端改读 voice_service 目录 `config.yaml`，客户端不再需要 |
 
-> 注：Voice Service 的配置/凭据/模型（`voice_service:` 段、`.env`、`models/`、KWS `keywords.txt`）全部落在 **`voice_service/` 子项目目录**（`/root/git/voice-assistant/voice_service/`），旧 `hermes-voice-agent/` 只留代码素材。
+> 注：Voice Service 的配置/凭据/模型（`voice_service:` 段、`.env`、`models/`、KWS `keywords.txt`）全部落在 **`voice_service/` 子项目目录**（`/root/git/voice-assistant/voice_service/`），旧实现目录已删除（历史见 git）。
 
 ### 6.2 systemd
 

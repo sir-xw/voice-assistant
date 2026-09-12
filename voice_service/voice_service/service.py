@@ -6,8 +6,8 @@ VoiceServiceApp：server + inbound（输入）+ playback（输出）的组合。
 - --audio：启用语音输入（打开麦克风监听，唤醒词 → ASR）；
 - --out：启用语音输出（TTS → 扬声器、提示音、等待音；会真实发声）。
 
-注意：同一机器上现役 hermes-voice-agent / voice-platform 运行期间不要加
---audio / --out 启动（设备/扬声器占用冲突）。
+注意：同一机器上同时只能有一个进程占用麦克风/扬声器；
+不要与其它语音服务并发启动（设备/扬声器占用冲突）。
 """
 
 from __future__ import annotations

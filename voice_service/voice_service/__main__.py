@@ -7,8 +7,7 @@ Voice Service 进程入口。
 
 - 默认：仅启动 WS 服务端（/healthz、hello、ping/pong；不动音频设备）；
 - --audio：启用语音输入（唤醒词监听；打开麦克风与腾讯云 ASR）。**注意**：
-  同一机器上同时只能有一个进程占用麦克风 —— 现役 hermes-voice-agent /
-  voice-platform 运行期间不要加本参数启动；
+  同一机器上同时只能有一个进程占用麦克风 —— 不要与其它语音服务并发启动；
 - --selfcheck：先跑协议自检。
 
 语音侧播放（TTS 播报/提示音/连续对话窗口）为 M3，尚未装配。

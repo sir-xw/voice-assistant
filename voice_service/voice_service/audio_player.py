@@ -20,7 +20,7 @@ import os
 logger = logging.getLogger(__name__)
 
 # set fixed pulse client name
-os.environ['PULSE_CLIENTNAME'] = 'hermes-voice-agent'
+os.environ['PULSE_CLIENTNAME'] = 'voice-service'
 
 
 class PlayerState(Enum):

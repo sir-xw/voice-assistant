@@ -26,7 +26,7 @@ protocol = []
 include = ["hermes_gateway_plugin*"]
 
 # hermes 插件 entry point：pip 安装即注册 voice-platform 语音平台插件。
-# 注意：若旧 hermes-voice-agent（voice_agent.gateway_plugin）仍以同名 entry point
-# 安装在同一 venv，会存在同名插件冲突 —— 迁移时先停用/卸载旧包（见架构文档 M4）。
+# 注意：旧的同名插件（voice_agent.gateway_plugin）已卸载退役；若在其它 venv 里同时
+# 安装了旧包，会存在同名 entry point 冲突（见架构文档 M4）。
 [project.entry-points."hermes_agent.plugins"]
 voice-platform = "hermes_gateway_plugin"
