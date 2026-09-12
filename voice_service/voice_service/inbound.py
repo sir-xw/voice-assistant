@@ -154,6 +154,8 @@ class Inbound:
             wake_word_keyword=fallback_name,
             wake_word_threshold=float(kws_cfg.get("threshold",
                                                   wake_cfg.get("threshold", 0.25))),
+            # KWS 命中加分（sherpa keywords_score，越高越容易被该词触发）
+            wake_word_score=float(kws_cfg.get("score", wake_cfg.get("score", 1.0))),
             kws_model_dir=kws_dir,
             kws_model_name=kws_cfg.get("model_name", DEFAULT_KWS_MODEL_NAME),
             kws_encoder=kws_cfg.get("encoder",
