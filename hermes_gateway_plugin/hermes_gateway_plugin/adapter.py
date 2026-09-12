@@ -110,6 +110,8 @@ class VoiceAdapter(BasePlatformAdapter):
         self._last_turn_by_wake: Dict[str, int] = {}
         # 钩子最近播报的最终回复（chat_id → 文本）：send() 去重用
         self._last_final_by_chat: Dict[str, str] = {}
+        # session_id → 助手名（惰性学习）：回复归属用，避免被后续唤醒抢占
+        self._session_wake: Dict[str, str] = {}
 
     # ─── 配置解析 ────────────────────────────────────────
 
@@ -118,6 +120,25 @@ class VoiceAdapter(BasePlatformAdapter):
         if svc["url"]:
             return svc["url"]
         return f"ws://{svc['host']}:{svc['port']}"
+
+    def _wake_for_hook(self, kwargs: Dict[str, Any]) -> str:
+        """把钩子回复归属到对应助手（按 session_id 惰性学习）。
+
+        `post_api_request` 只给 session_id；某会话**首次**出现时，当前活跃助手就是
+        它的归属方，记下映射；此后该会话的中间轮/最终回复都归它所有。这样用户在
+        助手 A 思考/调工具期间唤醒助手 B 后，A 迟到的回复仍标记为 A（Voice Service
+        据此丢弃 A 的 interim、给 A 的 final 加「我是A，」前缀），不会被错记到 B。
+        """
+        cur = self._current_wake or ""
+        sid = str(kwargs.get("session_id") or "")
+        if not sid:
+            return cur
+        wake = self._session_wake.get(sid)
+        if wake:
+            return wake
+        if cur:
+            self._session_wake[sid] = cur
+        return cur
 
     # ─── 生命周期 ────────────────────────────────────────
 
@@ -348,7 +369,7 @@ def on_post_api_request(**kwargs):
         if text.upper().strip("[]") == "FINISH":
             adapter._client.send_control("close_window")
             return
-        wake = adapter._current_wake or ""
+        wake = adapter._wake_for_hook(kwargs)
         is_final = finish_reason == "stop"
         segments = adapter._parse_segments(text)
         if not segments:

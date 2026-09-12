@@ -188,9 +188,12 @@ class Inbound:
     # ─── VoiceFrontend 回调（音频线程）────────────────────
 
     def _on_wake_word(self, name: str) -> None:
-        """唤醒命中：记录当前活跃唤醒词并上行事件。"""
+        """唤醒命中：记录当前活跃助手并上行事件。"""
         self._current_wake = name or self._current_wake
         logger.info("[inbound] 唤醒词: %s", name)
+        # 通知 playback 当前活跃助手（用于识别被其他对话打断的迟到回复）
+        if self.playback is not None:
+            self.playback.set_active_wake(self._current_wake)
         self._fire(P.EVT_WAKE_WORD, {"keyword": name, "wake": self._current_wake})
 
     def _on_interrupt_request(self) -> None:

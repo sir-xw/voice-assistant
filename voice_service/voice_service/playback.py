@@ -60,6 +60,8 @@ class Playback:
         self._last_turn_by_wake: Dict[str, int] = {}
         self._interrupted = False    # 本地打断标记（to_thread 内检查）
         self._playing = False        # 正在播放 TTS/资产（打断判定用）
+        # 当前活跃助手（wake_word 事件更新）：用于识别"被其他对话打断"的迟到回复
+        self._active_wake: str = ""
         # 等待回复
         self._waiting = 0
         self._wait_task: Optional[asyncio.Task] = None
@@ -154,6 +156,14 @@ class Playback:
     def on_utterance_done(self) -> None:
         """ASR 整段结果已上行：进入等待回复（循环等待音 + 超时兜底）。"""
         self._ts(self._utterance_done(), "on_utterance_done")
+
+    def set_active_wake(self, wake: str) -> None:
+        """更新当前活跃助手（wake_word 命中时由 inbound 调用）。
+
+        仅单属性赋值，线程安全；用于识别"被其他对话打断"的迟到回复：
+        wake ≠ active 的 interim 丢弃、final 排队并加「我是<助手名>，」前缀。
+        """
+        self._active_wake = wake or ""
 
     def on_interrupt(self) -> None:
         """本地打断（唤醒命中/抢话）：停 TTS、清队列、停等待音。"""
@@ -300,10 +310,28 @@ class Playback:
         #     超时未续话"两个真实收尾场景）。
         self._interrupted = False
         kind = job.get("kind") or P.SPEAK_FINAL
-        segments = job.get("segments") or []
+        wake = job.get("wake") or ""
+        segments = list(job.get("segments") or [])
         texts = [t for _, t in segments if t and t.strip()]
 
         is_final = kind in (P.SPEAK_FINAL, P.SPEAK_RAW)
+        # 被其他对话打断的迟到回复（wake ≠ 当前活跃助手）：
+        #   interim（中间轮）→ 丢弃（用户在跟新助手说话，旧过程性播报不再打扰）；
+        #   final（最终回答）→ 保留并排队（等当前播放结束），播报时加「我是<助手名>，」
+        #     前缀说明这是谁的回答（只有被打断的回复才需要前缀）。
+        interrupted_reply = bool(wake) and bool(self._active_wake) and wake != self._active_wake
+        if interrupted_reply and not is_final:
+            logger.info("[playback] 丢弃被打断会话的中间轮 speak（%s，当前活跃 %s）",
+                        wake, self._active_wake)
+            return
+        if interrupted_reply:
+            for i, (emo, text) in enumerate(segments):
+                if text and text.strip():
+                    segments[i] = (emo, f"我是{wake}，{text.strip()}")
+                    break
+            texts = [t for _, t in segments if t and t.strip()]
+            logger.info("[playback] 被打断会话的最终回复（%s），加前缀后排队播放", wake)
+
         # 播报期间是否需要保持"仍在等待最终回复"的语义（仅 interim 场景）
         keep_waiting = not is_final and self._waiting > 0
 
