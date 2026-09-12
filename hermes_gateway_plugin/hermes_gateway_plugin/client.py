@@ -11,8 +11,10 @@ Voice Gateway WS 客户端（可独立测试，不依赖 hermes）。
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
-from typing import Any, Callable, Dict, List, Optional
+import threading
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from voice_service import protocol as P
 
@@ -47,6 +49,10 @@ class VoiceGatewayClient:
         self._ping_task: Optional[asyncio.Task] = None
         self._on_event: Optional[FrameHandler] = None
         self._closing = False
+        # 请求/应答：seq → (Event, box)。工具 handler 在 agent 线程阻塞等 ack
+        self._seq = itertools.count(1)
+        self._ack_lock = threading.Lock()
+        self._ack_waiters: Dict[int, Tuple[threading.Event, Dict[str, Any]]] = {}
 
     # ─── 生命周期 ────────────────────────────────────────
 
@@ -102,6 +108,7 @@ class VoiceGatewayClient:
 
     async def close(self) -> None:
         self._closing = True
+        self._fail_pending("连接已关闭")
         for t in (self._writer_task, self._ping_task):
             if t is not None:
                 t.cancel()
@@ -117,28 +124,34 @@ class VoiceGatewayClient:
     async def run(self) -> None:
         """接收循环：阻塞直到断开。帧经 P.loads 后回调 _on_event。"""
         assert self._ws is not None, "先 connect()"
-        async for raw in self._ws:
-            if raw is None:
-                break
-            try:
-                frame = P.loads(raw)
-            except Exception as exc:
-                logger.warning("[voice client] 非法帧: %s", exc)
-                continue
-            type_ = frame.get("type")
-            if type_ == P.EVT_PONG:
-                logger.debug("[voice client] pong")
-                continue
-            if type_ == P.EVT_ACK:
-                logger.debug("[voice client] ack: %s", frame.get("data"))
-                continue
-            if self._on_event is not None:
+        try:
+            async for raw in self._ws:
+                if raw is None:
+                    break
                 try:
-                    self._on_event(frame)
-                except Exception:
-                    logger.exception("[voice client] 事件回调异常")
-            else:
-                logger.info("[voice client] 事件(未处理): %s", str(frame)[:160])
+                    frame = P.loads(raw)
+                except Exception as exc:
+                    logger.warning("[voice client] 非法帧: %s", exc)
+                    continue
+                type_ = frame.get("type")
+                if type_ == P.EVT_PONG:
+                    logger.debug("[voice client] pong")
+                    continue
+                if type_ == P.EVT_ACK:
+                    if self._resolve_ack(frame):
+                        continue
+                    logger.debug("[voice client] ack（无等待者）: %s", frame.get("data"))
+                    continue
+                if self._on_event is not None:
+                    try:
+                        self._on_event(frame)
+                    except Exception:
+                        logger.exception("[voice client] 事件回调异常")
+                else:
+                    logger.info("[voice client] 事件(未处理): %s", str(frame)[:160])
+        finally:
+            # 断线：唤醒所有等 ack 的工具调用，避免它们干等到超时
+            self._fail_pending("连接断开")
 
     async def reconnect_forever(self, handler: Optional[FrameHandler] = None,
                                 *, max_backoff_sec: float = 30.0) -> None:
@@ -183,6 +196,68 @@ class VoiceGatewayClient:
         self.send_frame(P.make_frame(P.CMD_CONTROL,
                                      {"action": action, **extra},
                                      client_id=self.client_id))
+
+    # ─── 请求/应答（线程安全，供 agent 工具 handler 调用）──
+
+    def request(self, frame_type: str, data: Dict[str, Any], *,
+                timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+        """发一帧并等它的 ``ack``，返回 ``ack.data``。
+
+        **只能在非事件循环线程调用**（agent 工具线程）：内部用 ``threading.Event``
+        阻塞等待，ack 由 ``run()``（事件循环）解析后唤醒。超时/未连接/断线返回
+        ``None``（调用方按失败处理）。
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and running is self._loop:
+            logger.error("[voice client] request() 不能在客户端事件循环线程内调用")
+            return None
+        if not self.is_connected:
+            logger.warning("[voice client] 未连接，无法发送 %s", frame_type)
+            return None
+
+        seq = next(self._seq)
+        ev = threading.Event()
+        box: Dict[str, Any] = {}
+        with self._ack_lock:
+            self._ack_waiters[seq] = (ev, box)
+        try:
+            self.send_frame(P.make_frame(frame_type, data, seq=seq,
+                                         client_id=self.client_id))
+            if not ev.wait(timeout):
+                logger.warning("[voice client] %s 等待 ack 超时（seq=%d, %.1fs）",
+                               frame_type, seq, timeout)
+                return None
+            return box.get("data")
+        finally:
+            with self._ack_lock:
+                self._ack_waiters.pop(seq, None)
+
+    def _resolve_ack(self, frame: Dict[str, Any]) -> bool:
+        """把 ack 交给对应等待者；没有等待者返回 False（如 speak 的 ack）。"""
+        data = frame.get("data") or {}
+        seq = data.get("seq")
+        if not isinstance(seq, int):
+            return False
+        with self._ack_lock:
+            waiter = self._ack_waiters.get(seq)
+        if waiter is None:
+            return False
+        ev, box = waiter
+        box["data"] = data
+        ev.set()
+        return True
+
+    def _fail_pending(self, reason: str) -> None:
+        """唤醒所有等待者并给出失败原因（断线/关闭）。"""
+        with self._ack_lock:
+            waiters = list(self._ack_waiters.items())
+            self._ack_waiters.clear()
+        for seq, (ev, box) in waiters:
+            box["data"] = {"seq": seq, "ok": False, "error": reason}
+            ev.set()
 
     # ─── 内部任务 ────────────────────────────────────────
 

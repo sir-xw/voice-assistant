@@ -69,11 +69,48 @@ platforms:
 ```bash
 systemctl --user restart hermes-gateway
 journalctl --user -u hermes-gateway -f | grep -E "voice|🎙"
-# 预期：voice-platform 已注册 → [voice client] 已连接 …（服务端助手表: [...]）→ ✓ voice connected
+# 预期：voice-platform 已注册（含工具 voice_speaker_bind / 工具集 voice_speaker）
+#      → [voice client] 已连接 …（服务端助手表: [...]）→ ✓ voice connected
 ```
 
 > - gateway 正常运行时若重启 voice-service，voice 平台会自动重连，无需操作 gateway。
 > - Voice Service 未启动时 voice 平台会持续退避重连（日志见 warning），起服务后自动恢复。
+
+## 说话人身份绑定工具（`voice_speaker_bind`）
+
+用户在语音里说清身份（"我是辰辰"）后，agent 用这个工具把**当前说话人的声纹编号**绑定到名字；
+之后该说话人的消息前缀就从「未知 (ID: 101)」变成「辰辰 (ID: 101)」，不必再问。
+
+- 工具集名 `voice_speaker`，**必须列进 hermes 的 voice 平台工具集**，否则工具不会进入 agent
+  的工具表（`platform_toolsets.voice` 是显式白名单）：
+
+```yaml
+platform_toolsets:
+  voice:
+    - browser
+    - file
+    - kanban
+    - memory
+    - session_search
+    - skills
+    - voice_speaker      # ← 本插件提供的工具集
+    - web
+```
+
+- 参数：`name`（必填，用户说出的身份名）、`spk_id`（可选，消息前缀里 `ID:` 后面的数字；
+  一轮里有多位说话人时必须指定）、`overwrite`（该编号已绑别的名字时，**先向用户确认**再置 true；
+  用户说"你认错了，我是xx"属于这种情况）。
+- 数据来源：`asr_result.data.speakers`（插件记下每个会话最近一轮的说话人与编号），**不解析
+  `text` 前缀**。只对语音会话生效（`session_id → wake` 映射仅由 `platform=voice` 的钩子学习），
+  CLI 等会话调用会被拒绝。
+- 写路径：插件发 WS `speaker_alias` 帧 → Voice Service 校验并写
+  `voice_service/models/voiceprint_lib/names.json` → **立即生效**（无需重启）。协议细节见
+  `voice_service/PROTOCOL.md` §4.1。
+- 名字与编号是**多对多**：声纹识别偏严，同一个人可能被注册成新编号，允许同一名字绑多个编号。
+- 绑定结果只用于称呼与上下文，**不是身份认证**；敏感操作仍需按业务规则确认。
+
+对应提示词规则（插件 `platform_hint`）：前缀已是具体名字 → 直接用、不再确认；前缀是「未知」
+且任务需要身份 → 先问清再绑定；只有用户亲口说明才绑定，不要猜；认错人时用 `overwrite` 更正。
 
 ## 每助手模型 / 提示词（channel_overrides，待决策）
 
@@ -117,6 +154,18 @@ Voice Service 据此处理被打断会话（详见 `voice_service/PROTOCOL.md` �
 
 ## 实现进度
 
-- [x] `client.py`：可独立运行的 WS 客户端（hello/welcome、ping、线程安全 send）
+- [x] `client.py`：可独立运行的 WS 客户端（hello/welcome、ping、线程安全 send/request）
 - [x] `adapter.py`：接入 hermes gateway 平台（WS 客户端 + `post_api_request` 钩子）
+- [x] `voice_speaker_bind` 工具（工具集 `voice_speaker`）：身份绑定 → `speaker_alias` 帧
 - [x] entry point（voice-platform）；旧 `voice_agent.gateway_plugin` 已退役
+
+## 测试
+
+无 pytest，用可执行脚本（在 hermes venv 中运行，不需要 gateway/语音设备）：
+
+```bash
+/usr/local/lib/hermes-agent/venv/bin/python -u hermes_gateway_plugin/tests/test_speaker_bind.py
+```
+
+覆盖：非语音会话/记录过旧/多说话人/编号不属于本轮等拒绝分支，正常帧内容与 ack 处理，
+冲突时的 overwrite 提示，以及工具注册（工具集名、schema、check_fn）。

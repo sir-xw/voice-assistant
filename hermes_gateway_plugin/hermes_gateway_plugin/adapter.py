@@ -15,6 +15,10 @@ voice-platform 适配器（M4）：语音平台 = Voice Service 的 WS 客户端
   参数摘要写入日志（前缀 `[voice] post_api_request:`），用于确认 memory
   审查轮（background review）与正常问答轮的字段差异 —— 待确认后据此过滤
   system 型消息（记忆更新/自我改进等），让语音只朗读"用户问题的直接回复"。
+- **工具**：`voice_speaker_bind`（工具集 `voice_speaker`）把当前语音说话人的声纹
+  编号绑定到名字。agent 只拿到文本前缀；插件从 `asr_result.data.speakers` 记下
+  每个会话最近一轮的说话人，工具调用时经 WS `speaker_alias` 交给 Voice Service
+  写 names.json（唯一映射在服务侧），ack 回结果。
 
 实现依赖 hermes gateway：必须在 hermes venv 中运行，且同 venv 需安装
 voice_service（协议契约 voice_service.protocol）。
@@ -45,6 +49,14 @@ logger = logging.getLogger(__name__)
 
 # 语音会话 chat_id 前缀：助手名 <名> → chat_id "wake:<名>"（名来自 Voice Service 上行）
 WAKE_CHAT_PREFIX = "wake:"
+
+# 说话人绑定工具的取数窗口：最近一轮语音多久内算"当前说话人"；显式指定编号时
+# 允许回溯的最近轮次范围（防止模型拿很久以前的编号来绑定）
+SPEAKER_CURRENT_MAX_AGE_SEC = 120.0
+SPEAKER_RECENT_MAX_AGE_SEC = 300.0
+SPEAKER_RECENT_KEEP = 8
+# 绑定请求等 ack 的超时（服务端只写一个小 json，1s 足够；留足抖动余量）
+SPEAKER_BIND_TIMEOUT_SEC = 5.0
 
 # gateway 系统通知内容特征：只在 send() 出现、不走 agent API → 静默不投递
 _SYSTEM_NOTICE_PREFIXES = (
@@ -108,6 +120,9 @@ class VoiceAdapter(BasePlatformAdapter):
         self._current_wake: Optional[str] = None
         # 每个会话最近一次 asr_result 的 turn_seq（speak 回填用）
         self._last_turn_by_wake: Dict[str, int] = {}
+        # 每个会话（wake）最近一轮的说话人：asr_result.speakers + 时间戳 + 最近编号
+        # （voice_speaker_bind 工具据此确定"当前说话人"）
+        self._last_utt_by_wake: Dict[str, Dict[str, Any]] = {}
         # 钩子最近播报的最终回复（chat_id → 文本）：send() 去重用
         self._last_final_by_chat: Dict[str, str] = {}
         # session_id → 助手名（惰性学习）：回复归属用，避免被后续唤醒抢占
@@ -199,6 +214,8 @@ class VoiceAdapter(BasePlatformAdapter):
                 turn = data.get("turn_seq")
                 if turn:
                     self._last_turn_by_wake[wake] = int(turn)
+                self._remember_speakers(wake, data.get("speakers") or [],
+                                        int(turn or 0))
                 text = (data.get("text") or "").strip()
                 if not text:
                     return
@@ -213,6 +230,119 @@ class VoiceAdapter(BasePlatformAdapter):
                 logger.debug("[voice] 客户端事件: %s", type_)
         except Exception as exc:
             logger.warning("[voice] 事件处理异常: %s", exc)
+
+    # ─── 说话人跟踪（voice_speaker_bind 工具用）────────────
+
+    def _remember_speakers(self, wake: str, speakers: List[Dict[str, Any]],
+                           turn: int = 0) -> None:
+        """记下某会话（wake）本轮说话人：当前轮 + 最近编号（供显式指定时校验）。"""
+        if not wake:
+            return
+        now = time.time()
+        prev = self._last_utt_by_wake.get(wake) or {}
+        recent = [(ts, sid) for ts, sid in (prev.get("recent") or [])
+                  if now - ts <= SPEAKER_RECENT_MAX_AGE_SEC]
+        for spk in speakers:
+            sid = str((spk or {}).get("spk_id") or "")
+            if sid and sid not in [s for _, s in recent]:
+                recent.append((now, sid))
+        self._last_utt_by_wake[wake] = {
+            "turn_seq": turn, "speakers": list(speakers), "ts": now,
+            "recent": recent[-SPEAKER_RECENT_KEEP:],
+        }
+
+    def _current_speakers(self, session_id: str) -> tuple[List[Dict[str, Any]], str, str]:
+        """当前会话最近一轮的说话人。
+
+        返回 ``(speakers, wake, error)``：``error`` 非空表示拿不到当前说话人
+        （不是语音会话 / 没有语音记录 / 太旧 / 没识别出编号）。
+        会话必须是**语音会话**（`_session_wake` 只对 platform=voice 的回调学习），
+        因此 CLI 等会话调用本工具会在这里被挡住。
+        """
+        sid = str(session_id or "")
+        wake = self._session_wake.get(sid) or ""
+        if not wake:
+            return [], "", "当前会话不是语音会话（voice_speaker_bind 只用于语音输入）"
+        utt = self._last_utt_by_wake.get(wake)
+        if not utt:
+            return [], wake, f"还没有 {wake} 会话的语音记录"
+        if time.time() - float(utt.get("ts") or 0) > SPEAKER_CURRENT_MAX_AGE_SEC:
+            return [], wake, "最近一轮语音已过去较久，无法确定当前说话人，请让用户再说一次"
+        speakers = [s for s in (utt.get("speakers") or []) if s.get("spk_id")]
+        if not speakers:
+            return [], wake, "这一轮没有识别到说话人编号（声纹未启用或未注册）"
+        return speakers, wake, ""
+
+    def _recent_speaker_ids(self, wake: str) -> List[str]:
+        """最近若干轮出现过的编号（显式指定 spk_id 时的合法集合）。"""
+        utt = self._last_utt_by_wake.get(wake) or {}
+        now = time.time()
+        return [sid for ts, sid in (utt.get("recent") or [])
+                if now - ts <= SPEAKER_RECENT_MAX_AGE_SEC]
+
+    def bind_speaker(self, args: Dict[str, Any], session_id: str = "",
+                     **kwargs: Any) -> str:
+        """`voice_speaker_bind` 工具：把当前说话人的声纹编号绑定到名字。
+
+        编号默认取"当前会话最近一轮的说话人"；一轮里有多个说话人时必须由模型显式
+        指定 `spk_id`（消息前缀里的编号）。写请求经 WS 交给 Voice Service（它持有
+        唯一映射与声纹库），成功返回该编号与名字。
+        """
+        from tools.registry import tool_error, tool_result
+
+        from voice_service import protocol as P
+
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return tool_error("name 不能为空：需要用户明确说出的身份名")
+
+        speakers, wake, err = self._current_speakers(session_id)
+        if err:
+            return tool_error(err)
+
+        want = str(args.get("spk_id") or "").strip()
+        if want:
+            spk_id = P.normalize_spk_id(want)
+            if not spk_id:
+                return tool_error(
+                    f"spk_id 非法: {want!r}（应填消息前缀里的编号，如 101）")
+            known = self._recent_speaker_ids(wake)
+            if known and spk_id not in known:
+                return tool_error(
+                    f"编号 {want} 不属于最近这轮说话人（本轮: "
+                    f"{', '.join(P.speaker_number(s) for s in known)}）；"
+                    f"请用消息前缀里的编号")
+        else:
+            ids = [str(s.get("spk_id")) for s in speakers]
+            if len(ids) != 1:
+                shown = "、".join(f"{s.get('label') or s.get('spk_id')}"
+                                  for s in speakers)
+                return tool_error(
+                    f"这一轮有多个说话人（{shown}），请带 spk_id 指定给谁绑定")
+            spk_id = ids[0]
+
+        if self._client is None:
+            return tool_error("语音服务未连接，绑定未完成")
+        ack = self._client.request(P.CMD_SPEAKER_ALIAS, {
+            "action": P.ALIAS_SET,
+            "spk_id": spk_id,
+            "name": name,
+            "overwrite": bool(args.get("overwrite")),
+        }, timeout=SPEAKER_BIND_TIMEOUT_SEC)
+        if ack is None:
+            return tool_error("语音服务未响应（超时或连接断开），绑定未完成")
+        if not ack.get("ok"):
+            return tool_error(str(ack.get("error") or "绑定失败"),
+                              spk_id=spk_id, name=name)
+        label = f"{ack.get('name') or name} (ID: {P.speaker_number(spk_id)})"
+        logger.info("[voice] 说话人绑定成功: %s → %s（previous=%s）",
+                    spk_id, ack.get("name") or name, ack.get("previous"))
+        return tool_result(
+            ok=True, spk_id=spk_id, name=ack.get("name") or name, label=label,
+            previous=ack.get("previous"), unchanged=bool(ack.get("unchanged")),
+            also_bound=ack.get("also_bound") or [],
+            note=f"以后该说话人的消息前缀会显示为 [{label}]",
+        )
 
     async def _handle_asr_message(self, wake: str, text: str) -> None:
         source = self.build_source(
@@ -383,6 +513,57 @@ def on_post_api_request(**kwargs):
         logger.warning("[voice] post_api_request 钩子异常: %s", exc)
 
 
+# ─── 说话人身份绑定工具（agent → WS speaker_alias → Voice Service）───
+
+VOICE_SPEAKER_BIND_SCHEMA = {
+    "name": "voice_speaker_bind",
+    "description": (
+        "把当前语音说话人的声纹编号绑定到一个名字（记住「这个声音是谁」）。"
+        "只用于语音对话：仅当用户亲口说明了自己的身份后才调用，不要猜测。"
+        "绑定成功后该说话人的消息前缀会从「未知 (ID: 101)」变成「辰辰 (ID: 101)」，"
+        "此后不必再问同一个人是谁。若该编号已经绑定为别的名字，"
+        "需要先向用户确认，再用 overwrite=true 更正（例如用户说“你认错了，我是辰辰”）。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "用户说出的身份名，如 辰辰、淘淘、爸爸",
+            },
+            "spk_id": {
+                "type": "string",
+                "description": (
+                    "可选：说话人编号（消息前缀里 ID: 后面的数字，如 101）。"
+                    "默认绑定当前说话人的编号；一轮里有多个说话人时必须指定。"
+                ),
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": (
+                    "该编号已绑定为别的名字时是否覆盖。仅在用户明确更正身份时置 true。"
+                ),
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+# 工具所属工具集（hermes 配置 platform_toolsets.voice 里需列出该名，见 README）
+VOICE_TOOLSET = "voice_speaker"
+
+
+def _handle_voice_speaker_bind(args: Dict[str, Any], **kwargs: Any) -> str:
+    """工具入口：按 session_id 定位到当前语会话，交给活跃适配器处理。"""
+    from tools.registry import tool_error
+
+    adapter = _get_active()
+    if adapter is None:
+        return tool_error("语音平台未连接，无法绑定说话人身份")
+    return adapter.bind_speaker(
+        args, session_id=str(kwargs.get("session_id") or ""))
+
+
 # ─── 前置检查 / 校验 ─────────────────────────────────────
 
 
@@ -441,6 +622,17 @@ def register(ctx) -> None:
             '编号不变，可据此区分不同说话人。说话人身份用于帮助理解对话上下文，\n'
             '回答时不需要复述说话人。\n'
             '\n'
+            '【说话人身份确认】\n'
+            '- 前缀已是「[辰辰 (ID: 100)]」这类具体名字 → 说明已认出是谁，直接用，不要再问。\n'
+            '- 前缀是「[未知 (ID: 101)]」且这次任务需要知道对方身份（例如"查我的课表"，\n'
+            '  而你手头有多人的数据）→ 先直接问清楚，例如"你是辰辰还是淘淘？"，不要替对方假定。\n'
+            '- 对方明确说明身份后，调用 voice_speaker_bind(name="辰辰") 记住（默认绑定当前\n'
+            '  说话人的编号），然后接着完成刚才的请求。只有对方亲口说明时才绑定，不要猜。\n'
+            '- 声纹识别偏严：同一个人可能拿到新的编号（又会显示为「未知 (ID: 10x)」）。\n'
+            '  用户说自己是某人时，即使那个人已有别的编号，也照样绑定（允许一人多编号）。\n'
+            '- 若发现认错人（用户说"你认错了，我是辰辰"）→ 用\n'
+            '  voice_speaker_bind(name="辰辰", overwrite=true) 更正。\n'
+            '\n'
             '【语音播报规则】\n'
             '你的每条文字回复都会被系统实时语音播报给用户（无需调用任何播报工具）。\n'
             '- 文字格式回复可以带情绪标识：格式为 (情绪)你要说的话。\n'
@@ -450,4 +642,16 @@ def register(ctx) -> None:
         ),
     )
     ctx.register_hook("post_api_request", on_post_api_request)
-    logger.info("voice-platform 已注册（钩子观察期：记录 post_api_request 参数）")
+    # 说话人身份绑定工具（工具集 voice_speaker，需在 hermes config 的
+    # platform_toolsets.voice 里列出该工具集才会进入 agent 的工具表）
+    ctx.register_tool(
+        name=VOICE_SPEAKER_BIND_SCHEMA["name"],
+        toolset=VOICE_TOOLSET,
+        schema=VOICE_SPEAKER_BIND_SCHEMA,
+        handler=_handle_voice_speaker_bind,
+        check_fn=is_connected,
+        description=VOICE_SPEAKER_BIND_SCHEMA["description"],
+        emoji="🗣️",
+    )
+    logger.info("voice-platform 已注册（含工具 %s / 工具集 %s）",
+                VOICE_SPEAKER_BIND_SCHEMA["name"], VOICE_TOOLSET)
