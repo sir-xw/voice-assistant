@@ -69,9 +69,7 @@ journalctl --user -u voice-service -f        # 日志：KWS initialized / 客户
 ```
 
 > - `--audio`（打开麦克风监听）/`--out`（扬声器播报）为真实硬件开关；不加则只起 WS 骨架。
-> - USB 音频故障修复脚本：`hermes-voice-agent/tools/repair_usb_audio.sh`（stop→重建 USB→start
->   voice-service，无需暂停标记协作）。
-> - hermes-gateway 无需随本服务重启：voice 平台是 WS 客户端，本服务重启后自动重连。
+> - 服务重启不影响 hermes-gateway：voice 平台是 WS 客户端，本服务恢复后自动重连。
 
 ## 实现进度
 
@@ -84,8 +82,7 @@ journalctl --user -u voice-service -f        # 日志：KWS initialized / 客户
       （Music Coordinator hold/release 音乐避让）；`--audio`/`--out` 开关（默认不出声/不占设备）
 - [x] `kws_words.py`：唤醒词↔助手映射唯一源 `wake_word.assistants`（config.yaml）→ 启动时
       生成/校验 KWS `keywords.txt`；`hello` 不再收客户端词表，`welcome.my_wakewords` 回填实际助手表
-- [x] 采集失效检测：麦克风无数据 → 关流 + 节流告警；恢复靠进程重启
-      （`hermes-voice-agent/tools/repair_usb_audio.sh` 改为 stop/start voice-service，无暂停标记协作）
+- [x] 采集失效检测：麦克风无数据 → 关流 + 节流告警（恢复靠重启 voice-service 进程）
 - [x] 真机联调部署：systemd user 服务 `voice-service.service` 以 `--audio --out --config config.yaml`
       运行，配合 hermes-gateway（WS 客户端）与 music-coordinator 全链路可用
 - [ ] M1 server 拆分为 hub/session 多连接管理（v1 保持单 client，为既定取舍；多路扩展按需再做）
